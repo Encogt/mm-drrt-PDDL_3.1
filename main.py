@@ -27,6 +27,8 @@ parser.add_argument('--use_debug', action='store_true')
 # dRRT params
 parser.add_argument('--drrt_num_iters', type=int, default=10)
 parser.add_argument('--drrt_time_limit', type=int, default=2000)
+# PDDL planner params
+parser.add_argument('--use_pddl_planner', action='store_true', help='Use PDDL 3.1 planner to generate task plan')
 
 opt = parser.parse_args()
 print(opt)
@@ -57,7 +59,29 @@ elif opt.env_type == 'exp_two_robots':
                                       grasp_type=opt.grasp_type, sim_id=sim_id, seed=opt.seed)
 
 # input plan skeleton and ordering constraints
-plan, action_orders, obj_orders, init_order_constraints = env.create_plan_order_constraints()
+if opt.use_pddl_planner:
+    from mm_drrt.planner.pddl_planner import PDDLPlanner, PDDLPlannerError, PDDLTimeoutError, has_pddl_support
+
+    if not has_pddl_support(env):
+        print(f"Warning: Environment {opt.env_type} does not support PDDL planning")
+        print("Falling back to manual plan specification...")
+        plan, action_orders, obj_orders, init_order_constraints = env.create_plan_order_constraints()
+    else:
+        print("Using PDDL 3.1 planner to generate task plan...")
+        planner = PDDLPlanner(timeout=30)
+        try:
+            plan, action_orders, obj_orders, init_order_constraints = planner.generate_plan(env)
+            print("Successfully generated plan using PDDL planner")
+        except PDDLTimeoutError as e:
+            print(f"PDDL planner timeout: {e}")
+            print("Falling back to manual plan...")
+            plan, action_orders, obj_orders, init_order_constraints = env.create_plan_order_constraints()
+        except PDDLPlannerError as e:
+            print(f"PDDL planning failed: {e}")
+            print("Falling back to manual plan...")
+            plan, action_orders, obj_orders, init_order_constraints = env.create_plan_order_constraints()
+else:
+    plan, action_orders, obj_orders, init_order_constraints = env.create_plan_order_constraints()
 
 assert opt.num_robots == len(action_orders), "Error: num_robots is not properly set"
 ps = PlanSkeleton(env, plan, obj_orders, init_order_constraints, opt.num_placement_samples, opt.use_debug)

@@ -1,4 +1,5 @@
 venv/
+.venv/
 .idea/
 data_sm*
 data_mm*
@@ -7,3 +8,4 @@ data_mm*
 experiments/run_*
 test_multirobot_t2
 *.mp4
+__pycache__/
