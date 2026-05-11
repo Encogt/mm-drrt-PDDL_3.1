@@ -300,16 +300,18 @@ class ExampleSingleRobotEnvironment(Environment):
         }
 
         init_state = [
-            ('robot-free', self.robots[0]),
-            ('robot-at-base', self.robots[0]),
-            ('obj-on', self.m_objs[0], self.f_objs[0]),
-            ('obj-clear', self.m_objs[0]),
+            ('robot-free',         self.robots[0]),
+            ('robot-at-base',      self.robots[0]),
+            ('obj-location',       self.m_objs[0], self.f_objs[0]),
+            ('obj-clear',          self.m_objs[0]),
             ('surface-accessible', self.f_objs[0]),
-            ('surface-accessible', self.f_objs[1])
+            ('surface-accessible', self.f_objs[1]),
+            ('robot-can-reach',    self.robots[0], self.f_objs[0]),
+            ('robot-can-reach',    self.robots[0], self.f_objs[1]),
         ]
 
         goal_state = [
-            ('obj-on', self.m_objs[0], self.f_objs[1]),
+            ('obj-location', self.m_objs[0], self.f_objs[1]),
             ('robot-free', self.robots[0])
         ]
 

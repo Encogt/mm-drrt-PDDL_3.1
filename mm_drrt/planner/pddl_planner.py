@@ -9,6 +9,8 @@ import sys
 from unified_planning.shortcuts import *
 from unified_planning.engines import PlanGenerationResultStatus
 
+get_environment().credits_stream = None
+
 from mm_drrt.planner.pddl_problem_generator import generate_problem
 from mm_drrt.utils.pddl_parser import parse_pddl_plan, _infer_from_fixed_obj
 
@@ -44,7 +46,7 @@ class PDDLPlanner:
     4. Error handling and validation
     """
 
-    def __init__(self, domain_file=None, planner_name='pyperplan', timeout=30):
+    def __init__(self, domain_file=None, planner_name=None, timeout=30):
         """
         Initialize PDDL planner.
 
@@ -84,19 +86,25 @@ class PDDLPlanner:
         except Exception as e:
             raise PDDLPlannerError(f"Problem generation failed: {e}")
 
-        # Select planner
+        # Select planner — auto-select by default to ensure PDDL 3.1 support
         try:
-            with OneshotPlanner(name=self.planner_name) as planner:
-                result = planner.solve(problem, timeout=self.timeout)
-        except Exception as e:
-            # Fallback to default planner if specified planner not available
-            print(f"Warning: Planner '{self.planner_name}' not available: {e}")
-            print("Falling back to default planner...")
-            try:
+            if self.planner_name is not None:
+                with OneshotPlanner(name=self.planner_name) as planner:
+                    result = planner.solve(problem, timeout=self.timeout)
+            else:
                 with OneshotPlanner(problem_kind=problem.kind) as planner:
                     result = planner.solve(problem, timeout=self.timeout)
-            except Exception as e2:
-                raise PDDLPlannerError(f"Planning failed with default planner: {e2}")
+        except Exception as e:
+            if self.planner_name is not None:
+                print(f"Warning: Planner '{self.planner_name}' failed: {e}")
+                print("Falling back to auto-selection by problem kind...")
+                try:
+                    with OneshotPlanner(problem_kind=problem.kind) as planner:
+                        result = planner.solve(problem, timeout=self.timeout)
+                except Exception as e2:
+                    raise PDDLPlannerError(f"Planning failed: {e2}")
+            else:
+                raise PDDLPlannerError(f"Planning failed: {e}")
 
         # Check result status
         if result.status == PlanGenerationResultStatus.SOLVED_SATISFICING:

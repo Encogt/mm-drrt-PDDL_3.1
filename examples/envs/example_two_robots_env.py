@@ -275,17 +275,99 @@ class ExampleTwoRobotsEnvironment(Environment):
                                 actions[obj_orders[id - 1]].goal['place'].assign()
 
     def create_plan_order_constraints(self):
-        plan = {'a0': ('transit', self.robots[0], self.m_objs[0], None, self.f_objs[0]),
-                'a1': ('transfer', self.robots[0], self.m_objs[0], self.f_objs[0], self.f_objs[1]),
-                'a2': ('transit', self.robots[1], self.m_objs[1], None, self.f_objs[1]),
-                'a3': ('transfer', self.robots[1], self.m_objs[1], self.f_objs[1], self.f_objs[0])
-                }
-        action_orders = {self.robots[0]: ('a0', 'a1'),
-                         self.robots[1]: ('a2', 'a3')}
-        obj_orders = {self.m_objs[0]: ['a1'],
-                      self.m_objs[1]: ['a3']}
-        init_order_constraints = ()
+        if self._num_m_objs == 1:
+            # Relay: robot0 picks from table0 → middle table, robot1 picks from middle → table2
+            plan = {
+                'a0': ('transit',  self.robots[0], self.m_objs[0], None,            self.f_objs[0]),
+                'a1': ('transfer', self.robots[0], self.m_objs[0], self.f_objs[0],  self.f_objs[1]),
+                'a2': ('transit',  self.robots[1], self.m_objs[0], None,            self.f_objs[1]),
+                'a3': ('transfer', self.robots[1], self.m_objs[0], self.f_objs[1],  self.f_objs[2]),
+            }
+            action_orders = {self.robots[0]: ('a0', 'a1'),
+                             self.robots[1]: ('a2', 'a3')}
+            obj_orders = {self.m_objs[0]: ['a1', 'a3']}
+            init_order_constraints = ({'pre': 'a1', 'post': 'a2'},)
+        else:
+            plan = {'a0': ('transit', self.robots[0], self.m_objs[0], None, self.f_objs[0]),
+                    'a1': ('transfer', self.robots[0], self.m_objs[0], self.f_objs[0], self.f_objs[1]),
+                    'a2': ('transit', self.robots[1], self.m_objs[1], None, self.f_objs[1]),
+                    'a3': ('transfer', self.robots[1], self.m_objs[1], self.f_objs[1], self.f_objs[0])
+                    }
+            action_orders = {self.robots[0]: ('a0', 'a1'),
+                             self.robots[1]: ('a2', 'a3')}
+            obj_orders = {self.m_objs[0]: ['a1'],
+                          self.m_objs[1]: ['a3']}
+            init_order_constraints = ()
         return plan, action_orders, obj_orders, init_order_constraints
+
+    def create_pddl_problem(self):
+        """
+        PDDL 3.1 problem for the 1-object / 2-robot relay scenario.
+
+        Layout:
+          f_objs[0] (table_start)  — box starts here
+          f_objs[1] (table_mid)    — relay handoff point
+          f_objs[2] (table_end)    — goal destination  [1-obj mode only]
+
+        The PDDL planner will find a plan; MM-dRRT handles physical reachability.
+        """
+        if self._num_m_objs == 1:
+            objects = {
+                'robot':       [self.robots[0], self.robots[1]],
+                'movable-obj': [self.m_objs[0]],
+                'fixed-obj':   [self.f_objs[0], self.f_objs[1], self.f_objs[2]],
+            }
+            init_state = [
+                ('robot-free',         self.robots[0]),
+                ('robot-free',         self.robots[1]),
+                ('robot-at-base',      self.robots[0]),
+                ('robot-at-base',      self.robots[1]),
+                ('obj-location',       self.m_objs[0], self.f_objs[0]),
+                ('obj-clear',          self.m_objs[0]),
+                ('surface-accessible', self.f_objs[0]),
+                ('surface-accessible', self.f_objs[1]),
+                ('surface-accessible', self.f_objs[2]),
+                # robot0 covers table_start and table_mid only
+                ('robot-can-reach',    self.robots[0], self.f_objs[0]),
+                ('robot-can-reach',    self.robots[0], self.f_objs[1]),
+                # robot1 covers table_mid and table_end only
+                ('robot-can-reach',    self.robots[1], self.f_objs[1]),
+                ('robot-can-reach',    self.robots[1], self.f_objs[2]),
+            ]
+            goal_state = [
+                ('obj-location', self.m_objs[0], self.f_objs[2]),
+                ('robot-free',   self.robots[0]),
+                ('robot-free',   self.robots[1]),
+            ]
+        else:
+            objects = {
+                'robot':       [self.robots[0], self.robots[1]],
+                'movable-obj': [self.m_objs[0], self.m_objs[1]],
+                'fixed-obj':   [self.f_objs[0], self.f_objs[1]],
+            }
+            init_state = [
+                ('robot-free',         self.robots[0]),
+                ('robot-free',         self.robots[1]),
+                ('robot-at-base',      self.robots[0]),
+                ('robot-at-base',      self.robots[1]),
+                ('obj-location',       self.m_objs[0], self.f_objs[0]),
+                ('obj-location',       self.m_objs[1], self.f_objs[1]),
+                ('obj-clear',          self.m_objs[0]),
+                ('obj-clear',          self.m_objs[1]),
+                ('surface-accessible', self.f_objs[0]),
+                ('surface-accessible', self.f_objs[1]),
+                ('robot-can-reach',    self.robots[0], self.f_objs[0]),
+                ('robot-can-reach',    self.robots[0], self.f_objs[1]),
+                ('robot-can-reach',    self.robots[1], self.f_objs[0]),
+                ('robot-can-reach',    self.robots[1], self.f_objs[1]),
+            ]
+            goal_state = [
+                ('obj-location', self.m_objs[0], self.f_objs[1]),
+                ('obj-location', self.m_objs[1], self.f_objs[0]),
+                ('robot-free',   self.robots[0]),
+                ('robot-free',   self.robots[1]),
+            ]
+        return objects, init_state, goal_state
 
     def _create_problem(self):
         other_arm = get_other_arm(self._arm)
@@ -294,6 +376,70 @@ class ExampleTwoRobotsEnvironment(Environment):
         plane = create_floor()
         self.custom_limits = {}
 
+        if self._num_m_objs == 1:
+            self._create_problem_1obj(other_arm, initial_conf)
+        else:
+            self._create_problem_2obj(other_arm, initial_conf)
+
+    def _create_problem_1obj(self, other_arm, initial_conf):
+        """
+        1 object, 2 robots, 3 tables in a line.
+
+        Layout (top view):
+          table_start (x=2)  —  table_mid (x=0)  —  table_end (x=-2)
+          robot0 starts at (1,  1)  — covers table_start and table_mid
+          robot1 starts at (-1, -1) — covers table_mid  and table_end
+
+        Plan: robot0 relays box from table_start to table_mid,
+              robot1 relays it from table_mid to table_end.
+        """
+        table = []
+        table.append(create_box(0.4, 0.4, 1.2, color=WHITE))   # table_start
+        set_point(table[0], (2, 0, 0))
+        table.append(create_box(0.4, 0.4, 1.2, color=TAN))     # table_mid
+        set_point(table[1], (0, 0, 0))
+        table.append(create_box(0.4, 0.4, 1.2, color=WHITE))   # table_end
+        set_point(table[2], (-2, 0, 0))
+        self.fixed_obstacles = table
+
+        boxes = []
+        self.m_objs_init_placements = {}
+        box_pose = ((2.05, 0.1, 0.68), (0, 0, 0, 1))
+        boxes.append(create_box(BOX[0], BOX[1], BOX[2], color=RED))
+        set_point(boxes[0], box_pose[0])
+        set_quat(boxes[0], box_pose[1])
+        self.m_objs_init_placements[boxes[0]] = Pose(boxes[0], box_pose, table[0])
+        print(box_pose)
+
+        self.robots = {}
+        self.robots_init_poses = {}
+        for i in range(self._num_robots):
+            self.robots[i] = create_pr2(robot=i)
+            if i == 0:
+                self.robots_init_poses[self.robots[i]] = (1, 1, 0)
+                self.custom_limits[self.robots[i]] = {0: (-1, 3), 1: (-2, 2)}
+            elif i == 1:
+                self.robots_init_poses[self.robots[i]] = (-1, -1, 0.5)
+                self.custom_limits[self.robots[i]] = {0: (-3, 1), 1: (-2, 2)}
+            else:
+                raise Exception("This scenario supports exactly 2 robots.")
+            for j in range(len(joints_from_names(self.robots[i], PR2_GROUPS['base']))):
+                set_joint_position(self.robots[i], joints_from_names(self.robots[i], PR2_GROUPS['base'])[j],
+                                   self.robots_init_poses[self.robots[i]][j])
+            set_arm_conf(self.robots[i], self._arm, initial_conf)
+            open_arm(self.robots[i], self._arm)
+            set_arm_conf(self.robots[i], other_arm, arm_conf(other_arm, REST_LEFT_ARM))
+            close_arm(self.robots[i], other_arm)
+
+        for robot in self.robots.values():
+            self._grippers[robot] = get_gripper(robot)
+
+        self.m_objs = boxes
+        self.f_objs = [table[0], table[1], table[2]]
+        self.m_obj_in_f_obj = {table[0]: set(boxes)}
+
+    def _create_problem_2obj(self, other_arm, initial_conf):
+        """2 objects, 2 robots, 2 tables — original behaviour."""
         table = []
         table.append(create_box(0.4, 0.4, 1.2, color=WHITE))
         set_point(table[0], (2, 0, 0))
@@ -305,20 +451,21 @@ class ExampleTwoRobotsEnvironment(Environment):
         self.m_objs_init_placements = {}
         for i in range(self._num_m_objs):
             if i == 0:
-                boxes.append(create_box(BOX[0], BOX[1], BOX[2], color=RED))  # table 0
+                boxes.append(create_box(BOX[0], BOX[1], BOX[2], color=RED))
                 box_pose = ((2.05, 0.1, 0.68), (0, 0, 0, 1))
                 print(box_pose)
                 set_point(boxes[i], box_pose[0])
                 set_quat(boxes[i], box_pose[1])
                 self.m_objs_init_placements[boxes[i]] = Pose(boxes[i], box_pose, table[0])
             elif i == 1:
-                boxes.append(create_box(BOX[0], BOX[1], BOX[2], color=BLUE))  # table 1
+                boxes.append(create_box(BOX[0], BOX[1], BOX[2], color=BLUE))
                 box_pose = ((-2.05, -0.1, 0.68), (0, 0, 0, 1))
                 print(box_pose)
                 set_point(boxes[i], box_pose[0])
                 set_quat(boxes[i], box_pose[1])
                 self.m_objs_init_placements[boxes[i]] = Pose(boxes[i], box_pose, table[1])
-            else: raise Exception("The number of objects is more than one.")
+            else:
+                raise Exception("The number of objects is more than two.")
 
         self.robots = {}
         self.robots_init_poses = {}
@@ -332,7 +479,7 @@ class ExampleTwoRobotsEnvironment(Environment):
                 self.robots_init_poses[self.robots[i]] = (0, -1, rotate_z * i)
                 self.custom_limits[self.robots[i]] = {0: (-3, 3), 1: (-3, 3)}
             else:
-                raise Exception("The number of robots is more than one.")
+                raise Exception("The number of robots is more than two.")
             for j in range(len(joints_from_names(self.robots[i], PR2_GROUPS['base']))):
                 set_joint_position(self.robots[i], joints_from_names(self.robots[i], PR2_GROUPS['base'])[j],
                                    self.robots_init_poses[self.robots[i]][j])
@@ -341,7 +488,6 @@ class ExampleTwoRobotsEnvironment(Environment):
             set_arm_conf(self.robots[i], other_arm, arm_conf(other_arm, REST_LEFT_ARM))
             close_arm(self.robots[i], other_arm)
 
-        # comment out for visualization
         for robot in self.robots.values():
             self._grippers[robot] = get_gripper(robot)
 
