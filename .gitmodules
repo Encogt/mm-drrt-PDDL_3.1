@@ -1,3 +1,3 @@
 [submodule "external/pybullet_planning"]
 	path = external/pybullet_planning
-	url = https://github.com/caelan/pybullet-planning.git
+	url = https://github.com/Encogt/pybullet-planning_python_3.git
