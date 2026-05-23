@@ -1,0 +1,92 @@
+problem name = mm-drrt-problem
+
+types = [robot, movable-obj, fixed-obj]
+
+fluents = [
+  bool robot-at-base[r=robot]
+  bool robot-free[r=robot]
+  bool holding[r=robot, m=movable-obj]
+  bool obj-clear[m=movable-obj]
+  bool surface-accessible[f=fixed-obj]
+  bool robot-can-reach[r=robot, f=fixed-obj]
+  fixed-obj obj-location[m=movable-obj]
+]
+
+actions = [
+  durative action transit(robot r, movable-obj m, fixed-obj from_f) {
+    duration = [10, 10]
+    conditions = [
+      [start]:
+        robot-free(r)
+        (obj-location(m) == from_f)
+        obj-clear(m)
+      [start, end]:
+        surface-accessible(from_f)
+        robot-can-reach(r, from_f)
+    ]
+    effects = [
+      start:
+        robot-free(r) := false:
+        obj-clear(m) := false:
+      end:
+        holding(r, m) := true:
+    ]
+    simulated effects = [
+    ]
+  }
+  durative action transfer(robot r, movable-obj m, fixed-obj to_f) {
+    duration = [10, 10]
+    conditions = [
+      [start]:
+        holding(r, m)
+      [start, end]:
+        surface-accessible(to_f)
+        robot-can-reach(r, to_f)
+    ]
+    effects = [
+      end:
+        robot-free(r) := true:
+        holding(r, m) := false:
+        obj-clear(m) := true:
+        obj-location(m) := to_f:
+    ]
+    simulated effects = [
+    ]
+  }
+]
+
+objects = [
+  robot: [robot_0, robot_1]
+  movable-obj: [movable_obj_0]
+  fixed-obj: [fixed_obj_0, fixed_obj_1, fixed_obj_2]
+]
+
+initial fluents default = [
+  bool robot-at-base[r=robot] := false
+  bool robot-free[r=robot] := false
+  bool holding[r=robot, m=movable-obj] := false
+  bool obj-clear[m=movable-obj] := false
+  bool surface-accessible[f=fixed-obj] := false
+  bool robot-can-reach[r=robot, f=fixed-obj] := false
+]
+
+initial values = [
+  robot-free(robot_0) := true
+  robot-free(robot_1) := true
+  robot-at-base(robot_0) := true
+  robot-at-base(robot_1) := true
+  obj-location(movable_obj_0) := fixed_obj_0
+  obj-clear(movable_obj_0) := true
+  surface-accessible(fixed_obj_0) := true
+  surface-accessible(fixed_obj_1) := true
+  surface-accessible(fixed_obj_2) := true
+  robot-can-reach(robot_0, fixed_obj_0) := true
+  robot-can-reach(robot_0, fixed_obj_1) := true
+  robot-can-reach(robot_1, fixed_obj_1) := true
+  robot-can-reach(robot_1, fixed_obj_2) := true
+]
+
+goals = [
+  ((obj-location(movable_obj_0) == fixed_obj_2) and robot-free(robot_0) and robot-free(robot_1))
+]
+

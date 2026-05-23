@@ -1,5 +1,5 @@
 (define (domain mm-drrt-manipulation)
-  (:requirements :strips :typing :object-fluents)
+  (:requirements :strips :typing :durative-actions :duration-inequalities :object-fluents)
 
   (:types
     robot
@@ -8,46 +8,48 @@
   )
 
   (:predicates
-    (robot-at-base ?r - robot)                     ; robot is at its base position
-    (robot-free ?r - robot)                        ; robot is not holding anything
-    (holding ?r - robot ?m - movable-obj)          ; robot holds object
-    (obj-clear ?m - movable-obj)                   ; object can be grasped
-    (surface-accessible ?f - fixed-obj)            ; surface is unblocked
-    (robot-can-reach ?r - robot ?f - fixed-obj)    ; robot can physically reach surface
+    (robot-at-base ?r - robot)
+    (robot-free ?r - robot)
+    (holding ?r - robot ?m - movable-obj)
+    (obj-clear ?m - movable-obj)
+    (surface-accessible ?f - fixed-obj)
+    (robot-can-reach ?r - robot ?f - fixed-obj)
   )
 
   (:functions
-    (obj-location ?m - movable-obj) - fixed-obj  ; surface the object rests on
+    (obj-location ?m - movable-obj) - fixed-obj
   )
 
-  (:action transit
+  (:durative-action transit
     :parameters (?r - robot ?m - movable-obj ?from - fixed-obj)
-    :precondition (and
-      (robot-free ?r)
-      (= (obj-location ?m) ?from)
-      (obj-clear ?m)
-      (surface-accessible ?from)
-      (robot-can-reach ?r ?from)
+    :duration (= ?duration 10)
+    :condition (and
+      (at start (robot-free ?r))
+      (at start (= (obj-location ?m) ?from))
+      (at start (obj-clear ?m))
+      (over all (surface-accessible ?from))
+      (over all (robot-can-reach ?r ?from))
     )
     :effect (and
-      (holding ?r ?m)
-      (not (robot-free ?r))
-      (not (obj-clear ?m))
+      (at start (not (robot-free ?r)))
+      (at start (not (obj-clear ?m)))
+      (at end   (holding ?r ?m))
     )
   )
 
-  (:action transfer
+  (:durative-action transfer
     :parameters (?r - robot ?m - movable-obj ?to - fixed-obj)
-    :precondition (and
-      (holding ?r ?m)
-      (surface-accessible ?to)
-      (robot-can-reach ?r ?to)
+    :duration (= ?duration 10)
+    :condition (and
+      (at start (holding ?r ?m))
+      (over all (surface-accessible ?to))
+      (over all (robot-can-reach ?r ?to))
     )
     :effect (and
-      (robot-free ?r)
-      (not (holding ?r ?m))
-      (obj-clear ?m)
-      (assign (obj-location ?m) ?to)
+      (at end (robot-free ?r))
+      (at end (not (holding ?r ?m)))
+      (at end (obj-clear ?m))
+      (at end (assign (obj-location ?m) ?to))
     )
   )
 

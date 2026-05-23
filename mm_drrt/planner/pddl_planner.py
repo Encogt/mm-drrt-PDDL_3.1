@@ -46,7 +46,8 @@ class PDDLPlanner:
     4. Error handling and validation
     """
 
-    def __init__(self, domain_file=None, planner_name=None, timeout=30):
+    def __init__(self, domain_file=None, planner_name=None, timeout=30,
+                 transit_duration=10, transfer_duration=10):
         """
         Initialize PDDL planner.
 
@@ -54,10 +55,14 @@ class PDDLPlanner:
             domain_file: Path to PDDL domain file (not used with UPF, kept for compatibility)
             planner_name: Name of planner to use (e.g., 'enhsp', 'tamer', 'pyperplan')
             timeout: Planning timeout in seconds
+            transit_duration: Fixed duration (seconds) for transit (pick) actions
+            transfer_duration: Fixed duration (seconds) for transfer (place) actions
         """
         self.domain_file = domain_file
         self.planner_name = planner_name
         self.timeout = timeout
+        self.transit_duration = transit_duration
+        self.transfer_duration = transfer_duration
 
     def generate_plan(self, env):
         """
@@ -82,7 +87,9 @@ class PDDLPlanner:
 
         # Generate problem
         try:
-            problem, mapper = generate_problem(env, save_to_file=False)
+            problem, mapper = generate_problem(env, save_to_file=True,
+                                               transit_duration=self.transit_duration,
+                                               transfer_duration=self.transfer_duration)
         except Exception as e:
             raise PDDLPlannerError(f"Problem generation failed: {e}")
 
@@ -126,7 +133,9 @@ class PDDLPlanner:
             if pddl_plan is None:
                 raise PDDLParseError("Planner returned None plan")
 
-            print(f"  Plan length: {len(pddl_plan.actions)} actions")
+            timed = hasattr(pddl_plan, 'timed_actions')
+            plan_len = len(pddl_plan.timed_actions) if timed else len(pddl_plan.actions)
+            print(f"  Plan length: {plan_len} actions")
 
             # Parse to MM-dRRT format
             plan, action_orders, obj_orders, init_order_constraints = \
@@ -188,11 +197,12 @@ class PDDLPlanner:
         if len(plan) == 0:
             raise ValueError("Generated plan is empty")
 
-        # Check that each robot has at least one action (unless it's a passive robot)
+        # Check that each robot (by PyBullet ID) has at least one action
         if hasattr(env, 'robots') and len(env.robots) > 0:
-            for robot in env.robots:
-                if robot not in action_orders:
-                    print(f"Warning: Robot {robot} has no actions in plan")
+            robot_ids = set(env.robots.values()) if isinstance(env.robots, dict) else set(env.robots)
+            for robot_id in robot_ids:
+                if robot_id not in action_orders:
+                    print(f"Warning: Robot {robot_id} has no actions in plan")
 
         print(f"  Plan validation passed:")
         print(f"    - {len(plan)} total actions")
