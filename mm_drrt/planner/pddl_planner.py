@@ -53,7 +53,7 @@ class PDDLPlanner:
 
         Args:
             domain_file: Path to PDDL domain file (not used with UPF, kept for compatibility)
-            planner_name: Name of planner to use (e.g., 'enhsp', 'tamer', 'pyperplan')
+            planner_name: Name of planner to use (e.g., 'enhsp', 'tamer')
             timeout: Planning timeout in seconds
             transit_duration: Fixed duration (seconds) for transit (pick) actions
             transfer_duration: Fixed duration (seconds) for transfer (place) actions

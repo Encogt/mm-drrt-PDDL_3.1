@@ -31,9 +31,9 @@ The original implementation used `:strips :typing` — basic classical PDDL — 
 | `mm_drrt/pddl/domains/mm_drrt_manipulation.pddl` | Added `:object-fluents` requirement; replaced `obj-on` boolean predicate with `(:functions (obj-location ?m) - fixed-obj)`; `transit` precondition now uses `(= (obj-location ?m) ?from)`; `transfer` effect now uses `(assign (obj-location ?m) ?to)` |
 | `mm_drrt/planner/pddl_domain.py` | Object fluent created as `Fluent('obj-location', FixedObj, m=MovableObj)`; precondition uses `Equals(obj_location(m), from_f)`; place effect uses `transfer.add_effect(obj_location(m), to_f)`; return value now separates `boolean_fluents` and `object_fluents` |
 | `mm_drrt/planner/pddl_problem_generator.py` | Detects fluent type via `fluent.type.is_bool_type()`; object fluents use `set_initial_value(fluent(key), value)` for init and `Equals(fluent(key), value)` for goal |
-| `mm_drrt/planner/pddl_planner.py` | Default planner changed from `'pyperplan'` to `None`; uses `OneshotPlanner(problem_kind=problem.kind)` so a planner supporting `:object-fluents` (Tamer) is selected automatically |
+| `mm_drrt/planner/pddl_planner.py` | Default planner is auto-selected (`None`); uses `OneshotPlanner(problem_kind=problem.kind)` so a planner supporting `:object-fluents` (Tamer) is selected automatically |
 | `examples/envs/example_single_robot_env.py` | `('obj-on', m, f)` → `('obj-location', m, f)` in both `init_state` and `goal_state` |
-| `requirements.txt` | Added `up-tamer` (required for `:object-fluents` support; `pyperplan` is STRIPS-only) |
+| `requirements.txt` | Added `up-tamer` (required for `:object-fluents` support) |
 
 ## Core Integration Components
 
