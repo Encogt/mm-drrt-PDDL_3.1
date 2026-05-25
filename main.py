@@ -86,7 +86,7 @@ else:
 assert opt.num_robots == len(action_orders), "Error: num_robots is not properly set"
 ps = PlanSkeleton(env, plan, obj_orders, init_order_constraints, opt.num_placement_samples, opt.use_debug)
 composite_path = ps.plan_refinement(opt.num_base_samples, opt.num_arm_samples, opt.drrt_num_iters, opt.drrt_time_limit)
-# data_saver(composite_path, opt)
+data_saver(composite_path, opt)
 
 if opt.use_gui:
     input("Simulation complete. Press Enter to close...")

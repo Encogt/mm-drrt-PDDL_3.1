@@ -1,6 +1,9 @@
 import pickle
 import os
 import argparse
+import sys
+
+sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), os.pardir)))
 
 from external.pybullet_planning.pybullet_tools.utils import join_paths, get_parent_dir, connect, disconnect, \
     disable_real_time, set_joint_positions, joint_from_name, wait_for_duration, set_camera_pose, VideoSaver
@@ -9,6 +12,7 @@ from external.pybullet_planning.pybullet_tools.pr2_utils import PR2_GROUPS
 from examples.envs.pick_place_env import PickPlaceEnvironment, PickPlaceCameraSetup
 from examples.envs.object_handover_env import ObjectHandoverEnvironment, ObjectHandoverCameraSetup
 from examples.envs.object_cleaning_env import ObjectCleaningEnvironment, ObjectCleaningCameraSetup
+from examples.envs.example_two_robots_env import ExampleTwoRobotsEnvironment, ExampleTwoRobotsCameraSetup
 
 from mm_drrt.utils.motion_planner_utils import get_max_length_list
 
@@ -18,7 +22,7 @@ Make sure to comment out "get_gripper" in pick_place_env.py; otherwise, the init
 
 parser = argparse.ArgumentParser()
 parser.add_argument('--load_file', type=str, required=True, help="file path and name")
-parser.add_argument('--env_type', type=str, default='cleaning')    # options: pickplace, handover, cleaning
+parser.add_argument('--env_type', type=str, default='cleaning')    # options: pickplace, handover, cleaning, exp_two_robots
 
 fopt = parser.parse_args()
 print(fopt)
@@ -48,6 +52,10 @@ elif fopt.env_type == 'cleaning':
     set_camera_pose(camera_point=ObjectCleaningCameraSetup[0], target_point=ObjectCleaningCameraSetup[1])
     env = ObjectCleaningEnvironment(num_robots=opt.num_robots, num_objs=opt.num_objs, arm=opt.arm,
                                     grasp_type=opt.grasp_type, sim_id=sim_id, seed=opt.seed)
+elif fopt.env_type == 'exp_two_robots':
+    set_camera_pose(camera_point=ExampleTwoRobotsCameraSetup[0], target_point=ExampleTwoRobotsCameraSetup[1])
+    env = ExampleTwoRobotsEnvironment(num_robots=opt.num_robots, num_objs=opt.num_objs, arm=opt.arm,
+                                      grasp_type=opt.grasp_type, sim_id=sim_id, seed=opt.seed)
 
 # video_saver = VideoSaver('mrtamp_video.mp4')
 
