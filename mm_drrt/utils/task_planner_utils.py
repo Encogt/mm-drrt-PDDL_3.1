@@ -200,6 +200,8 @@ def individual_path_computation(robot_plans, env, num_base_samples, num_arm_samp
     for robot in robot_plans:
         each_roadmaps, each_heuristic_vals = [], []
         for id, action in enumerate(robot_plans[robot]):
+            action_start = time.time()
+            print(f"Step 3: planning {action.name} ({action.type}) for robot {robot}")
             if action.type != 'return':
                 if id % 2 == 0: # pick actions
                     if id == 0:
@@ -231,9 +233,11 @@ def individual_path_computation(robot_plans, env, num_base_samples, num_arm_samp
             if result:
                 each_roadmaps += r_each_roadmaps
                 each_heuristic_vals += r_each_heuristic_vals
+                print(f"Step 3: {action.name} completed in {time.time() - action_start:.2f}s")
                 if use_debug:
                     print('In Step 3: '+ str(action) + ' is refined')
             else:
+                print(f"Step 3: {action.name} failed after {time.time() - action_start:.2f}s")
                 return False, [], []
         roadmaps.append(each_roadmaps)
         heuristic_vals.append(each_heuristic_vals)
@@ -255,7 +259,7 @@ def assign_order_constraints(robot_plans):
     constraints = []
     for r in robot_plans.keys():
         constraint = ()
-        for a in robot_plans[r]:
+        for action_idx, a in enumerate(robot_plans[r]):
             pre_set = a.order_constraints['pre']
             pre_index = []
             if pre_set:
@@ -265,6 +269,15 @@ def assign_order_constraints(robot_plans):
                         if robot_plans[nr][j].name in a.order_constraints['pre']:
                             pre_index.append({i: 3 * (j + 1) - 1})    # each action consists of three subactions: base motion, grasp motion, post-grasp motion
                             break
+            # Balance constraint: robot r's j-th action cannot complete until all
+            # other robots have reached sub-step 3*j-1 (nearly done with their j-th
+            # action). This prevents one robot racing far ahead of the others, which
+            # otherwise creates a near-empty composite state space that the dRRT*
+            # cannot search through within the time limit.
+            if action_idx > 0:
+                for i, nr in enumerate(robot_plans.keys()):
+                    if r == nr: continue
+                    pre_index.append({i: 3 * action_idx - 1})
             constraint += (pre_index,)
         constraints.append(constraint)
     return constraints

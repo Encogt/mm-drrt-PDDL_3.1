@@ -52,9 +52,14 @@ class dRRTStar:
         sub_q_last = get_sub_q_list(get_substarts_subgoals(self.starts, self.subprob_id, self.joint_dim), self.num_robots)
         sub_goals = get_sub_q_list(get_substarts_subgoals(self.goals, self.subprob_id, self.joint_dim), self.num_robots)
         is_found_path = False
+        loop_count = 0
 
         while time.time() < start_time + time_limit:
             start = time.time()
+            loop_count += 1
+            if loop_count == 1 or loop_count % 25 == 0:
+                elapsed = time.time() - start_time
+                print(f"Step 4: dRRT* search loop {loop_count}, elapsed {elapsed:.2f}s, nodes={len(self.nodes)}, subprob={self.subprob_id}")
             if is_found_path: break
             if use_debug_verbal: print('New loop starts. Time taken so far: %.2fs' % (time.time() - start_time))
             for i in range(num_iters):
@@ -205,7 +210,8 @@ class dRRTStar:
                 break
 
         if best_paths: print('dRRT* is solved successfully.')
-        else: SystemExit('TIMEOUT: dRRT* is NOT solved.')
+        else:
+            raise SystemExit('TIMEOUT: dRRT* is NOT solved.')
         return get_node_from_tree(self.nodes, get_substarts_subgoals(self.goals, self.subprob_id, self.joint_dim), self.subprob_id).retrace()
 
     def update_best_path(self, best_paths, best_path_cost):
