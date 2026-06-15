@@ -1,8 +1,9 @@
 """
 PDDL Plan Parser for MM-dRRT
 
-This module converts PDDL plans (from UPF or other planners) into MM-dRRT's
-expected format: (plan, action_orders, obj_orders, init_order_constraints).
+This module converts PDDL plans from UPF-style planners or Fast Downward into
+MM-dRRT's expected format: (plan, action_orders, obj_orders,
+init_order_constraints).
 """
 
 from collections import defaultdict
@@ -30,6 +31,7 @@ def parse_pddl_plan(pddl_plan, mapper, env):
 
     # Parse actions from PDDL plan
     actions_list = []
+    is_classical_plan = False
 
     if hasattr(pddl_plan, 'timed_actions'):
         # TimeTriggeredPlan (temporal/durative actions)
@@ -38,13 +40,25 @@ def parse_pddl_plan(pddl_plan, mapper, env):
             action_info = _parse_action(action, action_name, mapper, start_time, start_time + duration)
             actions_list.append(action_info)
             plan[action_name] = action_info['mm_drrt_format']
-    else:
+    elif hasattr(pddl_plan, 'actions'):
         # SequentialPlan (non-temporal actions)
         for i, action in enumerate(pddl_plan.actions):
             action_name = f"a{i}"
             action_info = _parse_action(action, action_name, mapper, i, i + 1)
             actions_list.append(action_info)
             plan[action_name] = action_info['mm_drrt_format']
+    else:
+        # Fast Downward plan text or a list of raw action lines
+        is_classical_plan = True
+        if isinstance(pddl_plan, str):
+            pddl_plan = pddl_plan.splitlines()
+        for raw_action in pddl_plan:
+            action_info = _parse_classical_action(raw_action, f"a{len(actions_list)}", mapper,
+                                                 len(actions_list), len(actions_list) + 1)
+            if action_info is None:
+                continue
+            actions_list.append(action_info)
+            plan[action_info['name']] = action_info['mm_drrt_format']
 
     # Extract action orders (group by robot)
     robot_actions = defaultdict(list)
@@ -66,8 +80,10 @@ def parse_pddl_plan(pddl_plan, mapper, env):
             action_name = action_info['name']
             obj_orders[obj].append(action_name)
 
-    # Extract temporal constraints (for multi-robot coordination)
-    init_order_constraints = extract_temporal_constraints(actions_list)
+    if is_classical_plan:
+        init_order_constraints = extract_sequential_constraints(actions_list)
+    else:
+        init_order_constraints = extract_temporal_constraints(actions_list)
 
     return plan, dict(action_orders), dict(obj_orders), init_order_constraints
 
@@ -89,14 +105,81 @@ def _parse_action(action, action_name, mapper, start_time, end_time):
     action_type = action.action.name
     parameters = action.actual_parameters
 
+    return _build_action_info(action_type, parameters, action_name, mapper, start_time, end_time)
+
+
+def _parse_classical_action(raw_action, action_name, mapper, start_time, end_time):
+    """
+    Parse a single Fast Downward action line into MM-dRRT format.
+
+    Args:
+        raw_action: A plan line such as "(transit robot_0 movable_obj_0 fixed_obj_0)"
+        action_name: Assigned action name (e.g., 'a0')
+        mapper: ObjectMapper
+        start_time: Action start time surrogate
+        end_time: Action end time surrogate
+
+    Returns:
+        dict or None: Action information including MM-dRRT format
+    """
+    tokens = _normalize_classical_action_line(raw_action)
+    if not tokens:
+        return None
+
+    action_type = tokens[0]
+    parameters = tokens[1:]
+    return _build_action_info(action_type, parameters, action_name, mapper, start_time, end_time)
+
+
+def _normalize_classical_action_line(raw_action):
+    if not isinstance(raw_action, str):
+        raw_action = str(raw_action)
+
+    line = raw_action.strip()
+    if not line or line.startswith(';'):
+        return None
+
+    if ':' in line:
+        prefix, suffix = line.split(':', 1)
+        if prefix.strip().isdigit():
+            line = suffix.strip()
+
+    if '[' in line and line.endswith(']'):
+        line = line.rsplit('[', 1)[0].strip()
+
+    if line.startswith('(') and line.endswith(')'):
+        line = line[1:-1].strip()
+
+    if not line:
+        return None
+
+    tokens = [t.lower() for t in line.split()]
+
+    # The serialize_cn compiler prefixes compiled action names with "do-".
+    # Strip that prefix so the downstream parser sees "transit", "transfer", etc.
+    if tokens:
+        tokens[0] = tokens[0].removeprefix('do-')
+
+    return tokens
+
+
+def _parameter_name(parameter):
+    if hasattr(parameter, 'object'):
+        return parameter.object().name
+    if hasattr(parameter, 'name'):
+        return parameter.name
+    return str(parameter)
+
+
+def _build_action_info(action_type, parameters, action_name, mapper, start_time, end_time):
     # Extract robot from parameters
-    robot_pddl = parameters[0].object().name
+    robot_pddl = _parameter_name(parameters[0])
     robot = mapper.get_pybullet_obj(robot_pddl)
 
     if action_type == 'transit':
         # transit(robot, movable-obj, from-fixed-obj)
-        movable_obj_pddl = parameters[1].object().name
-        from_fixed_obj_pddl = parameters[2].object().name
+        movable_obj_pddl = _parameter_name(parameters[1])
+        from_fixed_obj_pddl = _parameter_name(parameters[2])
 
         movable_obj = mapper.get_pybullet_obj(movable_obj_pddl)
         from_fixed_obj = mapper.get_pybullet_obj(from_fixed_obj_pddl)
@@ -118,8 +201,8 @@ def _parse_action(action, action_name, mapper, start_time, end_time):
 
     elif action_type == 'transfer':
         # transfer(robot, movable-obj, to-fixed-obj)
-        movable_obj_pddl = parameters[1].object().name
-        to_fixed_obj_pddl = parameters[2].object().name
+        movable_obj_pddl = _parameter_name(parameters[1])
+        to_fixed_obj_pddl = _parameter_name(parameters[2])
 
         movable_obj = mapper.get_pybullet_obj(movable_obj_pddl)
         to_fixed_obj = mapper.get_pybullet_obj(to_fixed_obj_pddl)
@@ -161,7 +244,9 @@ def _parse_action(action, action_name, mapper, start_time, end_time):
         }
 
     else:
-        raise ValueError(f"Unknown action type: {action_type}")
+        # Skip concurrency bookkeeping actions injected by the MA-PDDL compiler
+        # (e.g. "free", "start-*", "end-*").
+        return None
 
 
 def _infer_from_fixed_obj(actions_list):
@@ -247,6 +332,27 @@ def extract_obj_orders(actions_list):
                 obj_orders[obj].append(action_name)
 
     return dict(obj_orders)
+
+
+def extract_sequential_constraints(actions_list):
+    """
+    Derive cross-robot ordering constraints from a sequential (classical) plan.
+
+    For each transfer by robot A that places object O, find the next transit
+    by a different robot B that picks the same object O.  That causal link
+    must be enforced as an ordering constraint so B waits until A has placed O.
+    """
+    constraints = []
+    for i, a_i in enumerate(actions_list):
+        if a_i['type'] != 'transfer':
+            continue
+        for a_j in actions_list[i + 1:]:
+            if a_j['robot'] == a_i['robot']:
+                continue
+            if a_j['type'] == 'transit' and a_j['movable_obj'] == a_i['movable_obj']:
+                constraints.append({'pre': a_i['name'], 'post': a_j['name']})
+                break  # one constraint per transfer is enough
+    return tuple(constraints)
 
 
 def extract_temporal_constraints(actions_list):

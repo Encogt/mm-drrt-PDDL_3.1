@@ -11,6 +11,8 @@ Yoonchang Sung, Rahul Shome, and Peter Stone. "Asynchronous Task Plan Refinement
 git clone --recursive https://github.com/syc7446/mm-drrt.git
 cd mm-drrt/
 pip install -r requirements.txt
+# Install Fast Downward separately and make sure FAST_DOWNWARD_CMD points to
+# fast-downward.py or fast-downward on your system.
 python -m main
 ```
 

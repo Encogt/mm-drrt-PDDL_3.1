@@ -28,7 +28,8 @@ parser.add_argument('--use_debug', action='store_true')
 parser.add_argument('--drrt_num_iters', type=int, default=10)
 parser.add_argument('--drrt_time_limit', type=int, default=2000)
 # PDDL planner params
-parser.add_argument('--use_pddl_planner', action='store_true', help='Use PDDL 3.1 planner to generate task plan')
+parser.add_argument('--use_pddl_planner', action='store_true', help='Use classical Fast Downward planning to generate task plan')
+parser.add_argument('--pddl_timeout', type=int, default=30, help='Timeout in seconds for Fast Downward')
 
 opt = parser.parse_args()
 print(opt)
@@ -67,8 +68,8 @@ if opt.use_pddl_planner:
         print("Falling back to manual plan specification...")
         plan, action_orders, obj_orders, init_order_constraints = env.create_plan_order_constraints()
     else:
-        print("Using PDDL 3.1 planner to generate task plan...")
-        planner = PDDLPlanner(timeout=30)
+        print("Using classical Fast Downward planner to generate task plan...")
+        planner = PDDLPlanner(timeout=opt.pddl_timeout)
         try:
             plan, action_orders, obj_orders, init_order_constraints = planner.generate_plan(env)
             print("Successfully generated plan using PDDL planner")

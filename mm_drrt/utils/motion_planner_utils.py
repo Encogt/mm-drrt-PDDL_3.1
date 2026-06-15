@@ -1014,7 +1014,7 @@ def apply_order_constraints(q_new, q_near, r, order_constraint, sub_goals, subpr
         constraints = order_constraint[int(subprob_id[r] / 3)]
         for constraint in constraints:
             for constraint_r in constraint.keys():
-                if subprob_id[constraint_r] <= constraint[constraint_r]:
+                if subprob_id[constraint_r] < constraint[constraint_r]:
                     # print('order_constraint applied for robot ', r)
                     q_new = q_near
                     return q_new
@@ -1027,7 +1027,7 @@ def is_violate_order_constraints(order_constraints, subprob_id):
             constraints = order_constraints[r][int(subprob_id[r] / 3)]
             for constraint in constraints:
                 for constraint_r in constraint.keys():
-                    if subprob_id[constraint_r] <= constraint[constraint_r]:
+                    if subprob_id[constraint_r] < constraint[constraint_r]:
                         return True
     return False
 

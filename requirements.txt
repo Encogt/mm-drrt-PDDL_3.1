@@ -3,5 +3,3 @@ pybullet
 scipy
 matplotlib
 networkx
-unified-planning
-up-tamer
