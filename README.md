@@ -11,9 +11,35 @@ Yoonchang Sung, Rahul Shome, and Peter Stone. "Asynchronous Task Plan Refinement
 git clone --recursive https://github.com/syc7446/mm-drrt.git
 cd mm-drrt/
 pip install -r requirements.txt
-# Install Fast Downward separately and make sure FAST_DOWNWARD_CMD points to
-# fast-downward.py or fast-downward on your system.
 python -m main
+```
+
+### PDDL Planner (optional)
+
+To use `--use_pddl_planner`, two additional tools must be built from source.
+
+**1. Fast Downward**
+```
+git clone https://github.com/aibasel/downward.git ~/fast-downward
+cd ~/fast-downward
+python3 build.py
+```
+
+**2. universal-pddl-parser-multiagent** (serializes MA-PDDL to classical PDDL)
+```
+git clone --recursive https://github.com/aig-upf/universal-pddl-parser-multiagent.git ~/universal-pddl-parser-multiagent
+cd ~/universal-pddl-parser-multiagent/universal-pddl-parser
+scons
+cd ..
+scons examples/serialize_cn
+```
+
+If `scons` is not installed: `pip install scons`
+
+The code finds both tools automatically if they are at the default paths above. To use custom locations, set these environment variables:
+```
+export FAST_DOWNWARD_CMD=/path/to/fast-downward.py
+export UPDDL_SERIALIZER_CMD=/path/to/serialize.bin
 ```
 
 ## Inputs and Parameters
