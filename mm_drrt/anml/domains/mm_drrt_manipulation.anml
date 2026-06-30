@@ -1,0 +1,35 @@
+type Robot;
+type MovableObj;
+type FixedObj;
+
+fluent boolean robot_free(Robot r);
+fluent boolean holding(Robot r, MovableObj m);
+fluent boolean obj_clear(MovableObj m);
+fluent boolean surface_accessible(FixedObj f);
+fluent boolean robot_can_reach(Robot r, FixedObj f);
+fluent FixedObj obj_location(MovableObj m);
+
+// transit: robot r picks up object m from surface from_f
+action transit(Robot r, MovableObj m, FixedObj from_f) {
+  duration := 10;
+  [start]   robot_free(r);
+  [start]   obj_location(m) == from_f;
+  [start]   obj_clear(m);
+  [all]     surface_accessible(from_f);
+  [all]     robot_can_reach(r, from_f);
+  [start]   robot_free(r) := false;
+  [start]   obj_clear(m)  := false;
+  [end]     holding(r, m) := true;
+};
+
+// transfer: robot r places object m onto surface to_f
+action transfer(Robot r, MovableObj m, FixedObj to_f) {
+  duration := 10;
+  [start]   holding(r, m);
+  [all]     surface_accessible(to_f);
+  [all]     robot_can_reach(r, to_f);
+  [end]     robot_free(r)   := true;
+  [end]     holding(r, m)   := false;
+  [end]     obj_clear(m)    := true;
+  [end]     obj_location(m) := to_f;
+};

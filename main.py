@@ -10,6 +10,7 @@ from examples.envs.object_cleaning_env import ObjectCleaningEnvironment, ObjectC
 from examples.envs.example_single_robot_env import ExampleSingleRobotEnvironment, ExampleSingleRobotCameraSetup
 from examples.envs.example_two_robots_env import ExampleTwoRobotsEnvironment, ExampleTwoRobotsCameraSetup
 from mm_drrt.planner.task_planner import PlanSkeleton
+from mm_drrt.planner.tamer_planner import TamerPlanner, TamerPlannerError, has_anml_support
 from experiments.data_saver import data_saver
 
 parser = argparse.ArgumentParser()
@@ -24,12 +25,10 @@ parser.add_argument('--grasp_type', type=str, default='side')
 parser.add_argument('--env_type', type=str, default='exp_single_robot')    # options: pickplace, handover, cleaning, exp_single_robot, exp_two_robots
 parser.add_argument('--use_gui', action='store_false')
 parser.add_argument('--use_debug', action='store_true')
+parser.add_argument('--use_anml', action='store_true')
 # dRRT params
 parser.add_argument('--drrt_num_iters', type=int, default=10)
 parser.add_argument('--drrt_time_limit', type=int, default=2000)
-# PDDL planner params
-parser.add_argument('--use_pddl_planner', action='store_true', help='Use classical Fast Downward planning to generate task plan')
-parser.add_argument('--pddl_timeout', type=int, default=30, help='Timeout in seconds for Fast Downward')
 
 opt = parser.parse_args()
 print(opt)
@@ -59,28 +58,19 @@ elif opt.env_type == 'exp_two_robots':
     env = ExampleTwoRobotsEnvironment(num_robots=opt.num_robots, num_objs=opt.num_objs, arm=opt.arm,
                                       grasp_type=opt.grasp_type, sim_id=sim_id, seed=opt.seed)
 
-# input plan skeleton and ordering constraints
-if opt.use_pddl_planner:
-    from mm_drrt.planner.pddl_planner import PDDLPlanner, PDDLPlannerError, PDDLTimeoutError, has_pddl_support
-
-    if not has_pddl_support(env):
-        print(f"Warning: Environment {opt.env_type} does not support PDDL planning")
-        print("Falling back to manual plan specification...")
+if opt.use_anml and has_anml_support(env):
+    print("Using Tamer/ANML planner...")
+    planner = TamerPlanner()
+    try:
+        plan, action_orders, obj_orders, init_order_constraints = planner.generate_plan(env)
+        print("Successfully generated plan using Tamer/ANML")
+    except TamerPlannerError as e:
+        print(f"Tamer planning failed: {e}")
+        print("Falling back to manual plan...")
         plan, action_orders, obj_orders, init_order_constraints = env.create_plan_order_constraints()
-    else:
-        print("Using classical Fast Downward planner to generate task plan...")
-        planner = PDDLPlanner(timeout=opt.pddl_timeout)
-        try:
-            plan, action_orders, obj_orders, init_order_constraints = planner.generate_plan(env)
-            print("Successfully generated plan using PDDL planner")
-        except PDDLTimeoutError as e:
-            print(f"PDDL planner timeout: {e}")
-            print("Falling back to manual plan...")
-            plan, action_orders, obj_orders, init_order_constraints = env.create_plan_order_constraints()
-        except PDDLPlannerError as e:
-            print(f"PDDL planning failed: {e}")
-            print("Falling back to manual plan...")
-            plan, action_orders, obj_orders, init_order_constraints = env.create_plan_order_constraints()
+elif opt.use_anml and not has_anml_support(env):
+    print(f"Warning: --use_anml requested but {type(env).__name__} does not support ANML. Using manual plan.")
+    plan, action_orders, obj_orders, init_order_constraints = env.create_plan_order_constraints()
 else:
     plan, action_orders, obj_orders, init_order_constraints = env.create_plan_order_constraints()
 
