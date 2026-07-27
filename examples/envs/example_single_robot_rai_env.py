@@ -261,6 +261,40 @@ class ExampleSingleRobotRaiEnvironment(Environment):
         init_order_constraints = ()
         return plan, action_orders, obj_orders, init_order_constraints
 
+    def create_pddl_problem(self):
+        """
+        Define PDDL problem specification for single robot scenario.
+
+        Returns:
+            tuple: (objects, init_state, goal_state)
+                objects: dict mapping type → list of objects
+                init_state: list of initial predicates
+                goal_state: list of goal predicates
+        """
+        objects = {
+            'robot': [self.robots[0]],
+            'movable-obj': [self.m_objs[0]],
+            'fixed-obj': [self.f_objs[0], self.f_objs[1]]
+        }
+
+        init_state = [
+            ('robot-free',         self.robots[0]),
+            ('robot-at-base',      self.robots[0]),
+            ('obj-location',       self.m_objs[0], self.f_objs[0]),
+            ('obj-clear',          self.m_objs[0]),
+            ('surface-accessible', self.f_objs[0]),
+            ('surface-accessible', self.f_objs[1]),
+            ('robot-can-reach',    self.robots[0], self.f_objs[0]),
+            ('robot-can-reach',    self.robots[0], self.f_objs[1]),
+        ]
+
+        goal_state = [
+            ('obj-location', self.m_objs[0], self.f_objs[1]),
+            ('robot-free', self.robots[0])
+        ]
+
+        return objects, init_state, goal_state
+
     def _create_problem(self):
         self.custom_limits = {}
 
