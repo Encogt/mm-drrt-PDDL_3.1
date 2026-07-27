@@ -4,3 +4,5 @@ robotic
 scipy
 matplotlib
 networkx
+unified_planning
+up_tamer

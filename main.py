@@ -28,8 +28,8 @@ parser.add_argument('--use_debug', action='store_true')
 parser.add_argument('--drrt_num_iters', type=int, default=10)
 parser.add_argument('--drrt_time_limit', type=int, default=2000)
 # PDDL planner params
-parser.add_argument('--use_pddl_planner', action='store_true', help='Use classical Fast Downward planning to generate task plan')
-parser.add_argument('--pddl_timeout', type=int, default=30, help='Timeout in seconds for Fast Downward')
+parser.add_argument('--use_pddl_planner', action='store_true', help='Use automatic planning to generate task plan: tries Tamer (PDDL 3.1) first, falls back to Fast Downward (classical PDDL)')
+parser.add_argument('--pddl_timeout', type=int, default=30, help='Timeout in seconds for each planner')
 
 opt = parser.parse_args()
 print(opt)
@@ -60,29 +60,48 @@ elif opt.env_type == 'exp_two_robots':
                                       grasp_type=opt.grasp_type, sim_id=sim_id, seed=opt.seed)
 
 # input plan skeleton and ordering constraints
+# Planner preference order when --use_pddl_planner is set: Tamer (PDDL 3.1, solves the UPF
+# problem directly) first, then classical Fast Downward (via MA-PDDL compilation) if Tamer
+# fails, then the environment's manual plan as the last resort.
+planner_used = None
 if opt.use_pddl_planner:
+    from mm_drrt.planner.tamer_pddl_planner import TamerPDDLPlanner, TamerPlannerError, has_tamer_pddl_support
     from mm_drrt.planner.pddl_planner import PDDLPlanner, PDDLPlannerError, PDDLTimeoutError, has_pddl_support
 
-    if not has_pddl_support(env):
-        print(f"Warning: Environment {opt.env_type} does not support PDDL planning")
+    if has_tamer_pddl_support(env):
+        print("Trying Tamer planner (PDDL 3.1) to generate task plan...")
+        try:
+            planner = TamerPDDLPlanner(timeout=opt.pddl_timeout)
+            plan, action_orders, obj_orders, init_order_constraints = planner.generate_plan(env)
+            planner_used = 'Tamer (PDDL 3.1)'
+        except TamerPlannerError as e:
+            print(f"Tamer planning failed: {e}")
+    else:
+        print(f"Warning: Environment {opt.env_type} does not support Tamer PDDL planning")
+
+    if planner_used is None:
+        print("Falling back to classical Fast Downward planner...")
+        if not has_pddl_support(env):
+            print(f"Warning: Environment {opt.env_type} does not support PDDL planning")
+        else:
+            planner = PDDLPlanner(timeout=opt.pddl_timeout)
+            try:
+                plan, action_orders, obj_orders, init_order_constraints = planner.generate_plan(env)
+                planner_used = 'Fast Downward (classical PDDL)'
+            except PDDLTimeoutError as e:
+                print(f"PDDL planner timeout: {e}")
+            except PDDLPlannerError as e:
+                print(f"PDDL planning failed: {e}")
+
+    if planner_used is None:
         print("Falling back to manual plan specification...")
         plan, action_orders, obj_orders, init_order_constraints = env.create_plan_order_constraints()
-    else:
-        print("Using classical Fast Downward planner to generate task plan...")
-        planner = PDDLPlanner(timeout=opt.pddl_timeout)
-        try:
-            plan, action_orders, obj_orders, init_order_constraints = planner.generate_plan(env)
-            print("Successfully generated plan using PDDL planner")
-        except PDDLTimeoutError as e:
-            print(f"PDDL planner timeout: {e}")
-            print("Falling back to manual plan...")
-            plan, action_orders, obj_orders, init_order_constraints = env.create_plan_order_constraints()
-        except PDDLPlannerError as e:
-            print(f"PDDL planning failed: {e}")
-            print("Falling back to manual plan...")
-            plan, action_orders, obj_orders, init_order_constraints = env.create_plan_order_constraints()
+        planner_used = 'manual (create_plan_order_constraints)'
 else:
     plan, action_orders, obj_orders, init_order_constraints = env.create_plan_order_constraints()
+    planner_used = 'manual (create_plan_order_constraints)'
+
+print(f"Planner used: {planner_used}")
 
 assert opt.num_robots == len(action_orders), "Error: num_robots is not properly set"
 ps = PlanSkeleton(env, plan, obj_orders, init_order_constraints, opt.num_placement_samples, opt.use_debug)

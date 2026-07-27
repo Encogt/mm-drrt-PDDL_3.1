@@ -34,8 +34,13 @@ def parse_pddl_plan(pddl_plan, mapper, env):
     is_classical_plan = False
 
     if hasattr(pddl_plan, 'timed_actions'):
-        # TimeTriggeredPlan (temporal/durative actions)
-        for i, (start_time, action, duration) in enumerate(pddl_plan.timed_actions):
+        # TimeTriggeredPlan (temporal/durative actions).
+        # UPF/Tamer does not guarantee timed_actions is in chronological order.
+        # Sort by start_time so the plan dict and actions_list are chronological —
+        # initialize_robot_plans() preserves dict insertion order and
+        # individual_path_computation() assumes transit(even) before transfer(odd).
+        for i, (start_time, action, duration) in enumerate(
+                sorted(pddl_plan.timed_actions, key=lambda t: t[0])):
             action_name = f"a{i}"
             action_info = _parse_action(action, action_name, mapper, start_time, start_time + duration)
             actions_list.append(action_info)
@@ -80,10 +85,12 @@ def parse_pddl_plan(pddl_plan, mapper, env):
             action_name = action_info['name']
             obj_orders[obj].append(action_name)
 
-    if is_classical_plan:
-        init_order_constraints = extract_sequential_constraints(actions_list)
-    else:
-        init_order_constraints = extract_temporal_constraints(actions_list)
+    # Always use sequential constraint extraction: only add a constraint when
+    # robot A transfers object O and a different robot B later transits the same
+    # object O (handoff dependency). extract_temporal_constraints added spurious
+    # constraints between unrelated parallel actions (same end-time, different
+    # objects), which caused wrong ordering in individual_path_computation.
+    init_order_constraints = extract_sequential_constraints(actions_list)
 
     return plan, dict(action_orders), dict(obj_orders), init_order_constraints
 

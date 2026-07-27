@@ -269,14 +269,27 @@ def assign_order_constraints(robot_plans):
                         if robot_plans[nr][j].name in a.order_constraints['pre']:
                             pre_index.append({i: 3 * (j + 1) - 1})    # each action consists of three subactions: base motion, grasp motion, post-grasp motion
                             break
-            # Balance constraint: robot r's j-th action cannot complete until all
-            # other robots have reached sub-step 3*j-1 (nearly done with their j-th
-            # action). This prevents one robot racing far ahead of the others, which
-            # otherwise creates a near-empty composite state space that the dRRT*
-            # cannot search through within the time limit.
+            # Balance constraint: robot r's j-th action cannot start until all
+            # other robots have reached sub-step 3*j-1 (nearly done with their
+            # (j-1)-th action). This prevents one robot racing far ahead of the
+            # others, which otherwise creates a near-empty composite state space
+            # that dRRT* cannot search through within the time limit.
+            #
+            # Exception: if this action has a handoff post-constraint pointing to
+            # robot nr (meaning nr is waiting for THIS action to complete before it
+            # can begin), adding the balance would deadlock: nr can't advance past
+            # step 0 while r's balance waits for nr to be at step 2.
             if action_idx > 0:
+                nr_names_cache = {
+                    nr: {act.name for act in robot_plans[nr]}
+                    for nr in robot_plans if nr != r
+                }
+                post_set = a.order_constraints['post']
                 for i, nr in enumerate(robot_plans.keys()):
                     if r == nr: continue
+                    if any(isinstance(p, str) and p in nr_names_cache[nr]
+                           for p in post_set):
+                        continue  # handoff dependency — skip balance to avoid deadlock
                     pre_index.append({i: 3 * action_idx - 1})
             constraint += (pre_index,)
         constraints.append(constraint)
