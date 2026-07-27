@@ -1,0 +1,500 @@
+"""RAI (robotic / ry.Config) replacement for the pybullet-planning primitives used by
+mm_drrt.utils.motion_planner_utils. See /home/enco/.claude/plans/deep-wobbling-sonnet.md for the
+design this implements.
+
+Robot: RAI's built-in 'scenarios/panda_ranger.g' -- a 7-DOF Panda arm ('l_panda_joint1..7') on a
+3-DOF planar Ranger base ('ranger_transX', 'ranger_transY', 'ranger_rot'), with a gripper reference
+frame 'l_gripper'. This plays the role PR2 + its 'left'/'base' joint groups played in the pybullet
+version.
+
+Grasping is expressed with KOMO features (negDistance + scalarProduct alignment) against the target
+object's own frame, rather than porting pybullet-planning's explicit SE3 grasp-transform algebra.
+Grasped objects are carried via RAI's native C.attach(), so -- unlike the pybullet Attachment class --
+nothing needs to be re-applied per sampled configuration; once attached, every set_joint_positions()
+call keeps the object correctly posed relative to the gripper for free.
+"""
+import math
+import random
+import time
+
+import numpy as np
+import robotic as ry
+
+INF = float('inf')
+
+BASE_JOINTS = ['ranger_transX', 'ranger_transY', 'ranger_rot']
+ARM_JOINTS = [f'l_panda_joint{i}' for i in range(1, 8)]
+GRIPPER_FRAME = 'l_gripper'
+ROBOT_SCENARIO = 'scenarios/panda_ranger.g'
+ROBOT_FRAME_PREFIXES = ('ranger_', 'l_panda', 'l_finger', 'l_palm', 'l_gripper')
+
+# Reasonable folded/carry arm posture (within joint limits), used as the "resting" configuration
+# before/after a pick or place, analogous to PR2's TOP_HOLDING_LEFT_ARM / SIDE_HOLDING_LEFT_ARM.
+# This is Franka's standard self-collision-free "ready" pose (verified: no self-collision, and
+# clears a table at the base standoff radii uniform_pose_generator samples).
+PANDA_CARRY_CONF = (0.0, -0.785, 0.0, -2.356, 0.0, 1.571, 0.785)
+
+DEFAULT_ARM_RESOLUTION = math.radians(3)
+DEFAULT_BASE_RESOLUTION = 0.02
+COLLISION_TOLERANCE = 5e-3
+
+
+def is_robot_frame(name):
+    return name.startswith(ROBOT_FRAME_PREFIXES)
+
+
+##### Session #####
+
+def connect(use_gui=True):
+    C = ry.Config()
+    return C
+
+
+def refresh_view(C, use_gui=True):
+    """Call once after the scene (robot/tables/objects) has been fully built. The viewer needs
+    view_recopyMeshes() to pick up meshes added via addFile()/addFrame() after it was opened --
+    without it the window comes up but stays empty ("no robot"), since view() only shows whatever
+    was already in C at the time it was first called."""
+    if not use_gui:
+        return
+    C.view_recopyMeshes()
+    C.view(False, 'mm-drrt (RAI)')
+
+
+def disconnect(C):
+    try:
+        C.view_close()
+    except AttributeError:
+        pass
+
+
+def set_camera_pose(C, camera_point=None, target_point=None):
+    # RAI's default viewer camera is adequate for the POC; nothing else to wire up.
+    return
+
+
+##### Joint state #####
+
+_joint_index_cache = {}
+
+
+def _joint_indices(C, joint_names):
+    key = id(C)
+    all_names = _joint_index_cache.get(key)
+    if all_names is None or all_names != list(C.getJointNames()):
+        all_names = list(C.getJointNames())
+        _joint_index_cache[key] = all_names
+    return [all_names.index(n) for n in joint_names]
+
+
+def get_joint_positions(C, joint_names):
+    idx = _joint_indices(C, joint_names)
+    return tuple(np.asarray(C.getJointState())[idx])
+
+
+def set_joint_positions(C, joint_names, values):
+    C.setJointState(np.asarray(values, dtype=float), list(joint_names))
+
+
+def get_joint_limits(C, joint_names):
+    idx = _joint_indices(C, joint_names)
+    limits = C.getJointLimits()
+    lower = np.asarray(limits[0])[idx]
+    upper = np.asarray(limits[1])[idx]
+    return lower, upper
+
+
+def get_custom_limits(C, joint_names, custom_limits={}):
+    lower, upper = get_joint_limits(C, joint_names)
+    lower, upper = list(lower), list(upper)
+    for i, name in enumerate(joint_names):
+        if name in custom_limits:
+            lower[i], upper[i] = custom_limits[name]
+    return lower, upper
+
+
+##### Pose / Conf state objects (API mirrors pr2_primitives.Pose/Conf) #####
+
+class Conf(object):
+    def __init__(self, C, joint_names, values=None, init=False):
+        self.C = C
+        self.joints = list(joint_names)
+        if values is None:
+            values = get_joint_positions(C, joint_names)
+        self.values = tuple(values)
+        self.init = init
+
+    def assign(self):
+        set_joint_positions(self.C, self.joints, self.values)
+
+    def __repr__(self):
+        return 'q{}'.format(id(self) % 1000)
+
+
+class Pose(object):
+    _num = 0
+
+    def __init__(self, C, frame_name, value=None, support=None, init=False):
+        self.C = C
+        self.frame_name = frame_name
+        if value is None:
+            f = C.getFrame(frame_name)
+            value = (tuple(f.getPosition()), tuple(f.getQuaternion()))
+        self.value = value
+        self.support = support
+        self.init = init
+        Pose._num += 1
+        self.index = Pose._num
+
+    def assign(self):
+        f = self.C.getFrame(self.frame_name)
+        point, quat = self.value
+        f.setPosition(point)
+        f.setQuaternion(quat)
+
+    def __repr__(self):
+        return 'p{}'.format(self.index)
+
+
+class Grasp(object):
+    """A grasp 'style' expressed as KOMO objectives against the object's own frame, rather than a
+    pre-computed SE3 gripper-from-object transform. grasp_type in {'top', 'side'} only changes which
+    scalarProduct alignment objective is added at IK time (see rai_ik())."""
+
+    def __init__(self, grasp_type, obj_frame_name, carry=PANDA_CARRY_CONF, approach=0.12):
+        self.grasp_type = grasp_type
+        self.obj_frame_name = obj_frame_name
+        self.carry = tuple(carry)
+        self.approach = approach
+        self.grasp_width = 0.0
+
+    def attach(self, C, gripper_frame=GRIPPER_FRAME):
+        C.attach(gripper_frame, self.obj_frame_name)
+
+    def detach(self, C, new_parent_frame):
+        C.attach(new_parent_frame, self.obj_frame_name)
+
+    def __repr__(self):
+        return 'g({})'.format(self.grasp_type)
+
+
+##### Sampling primitives (the 4 closures prm.py / motion_planner_utils.py depend on) #####
+
+def get_sample_fn(C, joint_names, custom_limits={}):
+    lower, upper = get_custom_limits(C, joint_names, custom_limits)
+    lower, upper = np.asarray(lower), np.asarray(upper)
+
+    def sample_fn():
+        return tuple(np.random.uniform(lower, upper))
+
+    return sample_fn
+
+
+def get_distance_fn(C, joint_names, weights=None):
+    if weights is None:
+        weights = np.ones(len(joint_names))
+    weights = np.asarray(weights)
+    n = len(weights)
+
+    def distance_fn(q1, q2):
+        # prm.py's PRM.__call__() calls this on full expand_type-concatenated tuples (base+arm or
+        # arm+base), not just this function's own len(joint_names) sub-range. The pybullet original
+        # tolerated that via zip()'s implicit shortest-iterable truncation; replicate that here by
+        # truncating both configs to the first n=len(weights) entries (matches the base-first /
+        # base-prefix convention prm.py's expand_type branches use).
+        diff = np.asarray(q2[:n]) - np.asarray(q1[:n])
+        return math.sqrt(np.dot(weights, diff * diff))
+
+    return distance_fn
+
+
+def get_extend_fn(C, joint_names, resolutions=None):
+    if resolutions is None:
+        resolutions = np.array([
+            DEFAULT_BASE_RESOLUTION if name in BASE_JOINTS else DEFAULT_ARM_RESOLUTION
+            for name in joint_names
+        ])
+    resolutions = np.asarray(resolutions)
+
+    def extend_fn(q1, q2):
+        q1, q2 = np.asarray(q1), np.asarray(q2)
+        diff = q2 - q1
+        steps = int(np.max(np.abs(diff) / resolutions)) if len(diff) else 0
+        steps = max(steps, 1)
+        for i in range(1, steps + 1):
+            yield tuple(q1 + diff * (float(i) / steps))
+
+    return extend_fn
+
+
+def all_between(lower, values, upper):
+    return bool(np.less_equal(lower, values).all() and np.less_equal(values, upper).all())
+
+
+def check_collisions(C, obstacles=[], attachments=[], self_collisions=True, tolerance=COLLISION_TOLERANCE,
+                     verbose=False):
+    """True if the CURRENT config state has any disallowed collision: robot self-collision (if
+    self_collisions), or robot/attached-object penetrating a named obstacle frame. Does not touch
+    joint state -- callers set it first. Shared by get_collision_fn (per-sample, PRM-facing) and
+    rai_ik / get_ik_fn (so IK solutions are validated for self-collision too, not just obstacles)."""
+    obstacle_names = set(obstacles)
+    attached_names = set(attachments)
+    C.computeCollisions()
+    for a, b, pen in C.getCollisions():
+        if pen >= -tolerance:
+            continue
+        a_robot, b_robot = is_robot_frame(a), is_robot_frame(b)
+        a_att, b_att = a in attached_names, b in attached_names
+        a_obs, b_obs = a in obstacle_names, b in obstacle_names
+        if (a_att and b_robot) or (b_att and a_robot):
+            continue  # object touching the gripper that is holding it: expected
+        if a_att and b_att:
+            continue
+        if a_robot and b_robot:
+            if self_collisions:
+                if verbose:
+                    print('Self-collision:', a, b, pen)
+                return True
+            continue
+        if (a_robot or a_att) and b_obs:
+            if verbose:
+                print('Collision:', a, b, pen)
+            return True
+        if (b_robot or b_att) and a_obs:
+            if verbose:
+                print('Collision:', a, b, pen)
+            return True
+    return False
+
+
+def get_collision_fn(C, joint_names, obstacles=[], attachments=[], self_collisions=True,
+                     disabled_collisions=set(), custom_limits={}, max_distance=None,
+                     use_aabb=False, cache=True, tolerance=COLLISION_TOLERANCE, **kwargs):
+    lower, upper = get_custom_limits(C, joint_names, custom_limits)
+
+    def collision_fn(q, verbose=False):
+        if not all_between(lower, q, upper):
+            if verbose:
+                print('Joint limits violated:', q)
+            return True
+        set_joint_positions(C, joint_names, q)
+        return check_collisions(C, obstacles, attachments, self_collisions, tolerance, verbose)
+
+    return collision_fn
+
+
+def check_initial_end(start_conf, end_conf, collision_fn, verbose=True):
+    if collision_fn(start_conf, verbose=verbose):
+        print('Warning: initial configuration is in collision')
+        return False
+    if collision_fn(end_conf, verbose=verbose):
+        print('Warning: end configuration is in collision')
+        return False
+    return True
+
+
+def pairwise_collision(C, name_a, name_b, tolerance=COLLISION_TOLERANCE):
+    C.computeCollisions()
+    for a, b, pen in C.getCollisions():
+        if pen >= -tolerance:
+            continue
+        if {a, b} == {name_a, name_b}:
+            return True
+    return False
+
+
+def robot_obstacle_collision(C, obstacle_names, tolerance=COLLISION_TOLERANCE):
+    """True if any robot frame currently penetrates any of the named obstacle frames."""
+    obstacle_names = set(obstacle_names)
+    C.computeCollisions()
+    for a, b, pen in C.getCollisions():
+        if pen >= -tolerance:
+            continue
+        a_robot, b_robot = is_robot_frame(a), is_robot_frame(b)
+        if (a_robot and b in obstacle_names) or (b_robot and a in obstacle_names):
+            return True
+    return False
+
+
+def plan_direct_joint_motion(C, joint_names, end_conf, obstacles=[], attachments=[],
+                             self_collisions=True, custom_limits={}, resolutions=None, **kwargs):
+    extend_fn = get_extend_fn(C, joint_names, resolutions=resolutions)
+    collision_fn = get_collision_fn(C, joint_names, obstacles, attachments, self_collisions,
+                                    custom_limits=custom_limits)
+    start_conf = get_joint_positions(C, joint_names)
+    path = [start_conf] + list(extend_fn(start_conf, end_conf))
+    if any(collision_fn(q) for q in path):
+        return None
+    return path
+
+
+##### Grasp-pose IK via KOMO #####
+
+def rai_ik(C, base_conf, grasp, custom_limits={}, view=False, max_attempts=6):
+    """Fixes the base at base_conf, solves for arm joint values that bring GRIPPER_FRAME into a
+    grasp of grasp.obj_frame_name. Returns an arm conf tuple, or None if infeasible."""
+    set_joint_positions(C, BASE_JOINTS, base_conf)
+    C.selectJoints(ARM_JOINTS)
+    try:
+        lower, upper = get_custom_limits(C, ARM_JOINTS, custom_limits)
+        for attempt in range(max_attempts):
+            # enableCollisions + a soft accumulatedCollisions penalty steers the solver away from
+            # self- and table-colliding solutions (a plain negDistance/scalarProduct solve regularly
+            # converges to self-colliding arm configs, since nothing in the objective discourages
+            # it). Soft (OT.sos) rather than hard (OT.ineq) so a tight-but-feasible grasp doesn't get
+            # thrown out; get_ik_fn's check_collisions() call is the actual accept/reject gate.
+            komo = ry.KOMO(C, phases=1, slicesPerPhase=1, kOrder=0, enableCollisions=True)
+            komo.addControlObjective([], 0, 1e-1)
+            komo.addObjective([1], ry.FS.accumulatedCollisions, [], ry.OT.sos, [3e1])
+            komo.addObjective([1], ry.FS.negDistance, [GRIPPER_FRAME, grasp.obj_frame_name],
+                              ry.OT.eq, [1e1])
+            if grasp.grasp_type == 'top':
+                komo.addObjective([1], ry.FS.scalarProductXZ, [GRIPPER_FRAME, grasp.obj_frame_name],
+                                  ry.OT.eq, [1e1], [0.0])
+            else:
+                komo.addObjective([1], ry.FS.scalarProductXY, [GRIPPER_FRAME, grasp.obj_frame_name],
+                                  ry.OT.eq, [1e1], [0.0])
+            if attempt > 0:
+                x_init = np.random.uniform(lower, upper)
+                komo.initWithConstant(x_init)
+            ret = ry.NLP_Solver(komo.nlp(), verbose=0).solve()
+            ret = ret.dict()
+            if view:
+                komo.view(True, 'IK attempt {}'.format(attempt))
+            if ret['ineq'] < 1 and ret['eq'] < 1 and ret['feasible']:
+                q = tuple(komo.getPath()[0])
+                if all_between(lower, q, upper):
+                    return q
+        return None
+    finally:
+        C.selectJoints(BASE_JOINTS + ARM_JOINTS)
+
+
+##### Grasp generation #####
+
+def get_top_grasps(obj_frame_name, carry=PANDA_CARRY_CONF):
+    return [Grasp('top', obj_frame_name, carry=carry)]
+
+
+def get_side_grasps(obj_frame_name, carry=PANDA_CARRY_CONF):
+    return [Grasp('side', obj_frame_name, carry=carry)]
+
+
+##### Base pose sampling (IR / reachability) #####
+
+def uniform_pose_generator(C, target_xy, min_radius=0.55, max_radius=0.7):
+    while True:
+        radius = random.uniform(min_radius, max_radius)
+        theta = random.uniform(-math.pi, math.pi)
+        x = target_xy[0] + radius * math.cos(theta)
+        y = target_xy[1] + radius * math.sin(theta)
+        facing = math.atan2(target_xy[1] - y, target_xy[0] - x)
+        yield (x, y, facing)
+
+
+##### Frame helpers #####
+
+def remove_frame(C, frame_name):
+    C.delFrame(frame_name)
+
+
+def get_frame_position(C, frame_name):
+    return tuple(C.getFrame(frame_name).getPosition())
+
+
+def is_placement(C, obj_frame_name, surface_frame_name, epsilon=0.02):
+    obj = C.getFrame(obj_frame_name)
+    surface = C.getFrame(surface_frame_name)
+    obj_pos = np.asarray(obj.getPosition())
+    surf_pos = np.asarray(surface.getPosition())
+    obj_size = np.asarray(obj.getSize()[:3])
+    surf_size = np.asarray(surface.getSize()[:3])
+    surface_top_z = surf_pos[2] + surf_size[2] / 2.0
+    obj_bottom_z = obj_pos[2] - obj_size[2] / 2.0
+    within_xy = (abs(obj_pos[0] - surf_pos[0]) <= surf_size[0] / 2.0 + obj_size[0] / 2.0 and
+                abs(obj_pos[1] - surf_pos[1]) <= surf_size[1] / 2.0 + obj_size[1] / 2.0)
+    return within_xy and abs(obj_bottom_z - surface_top_z) <= epsilon
+
+
+def sample_placement(C, obj_frame_name, surface_frame_name, margin=0.02):
+    surface = C.getFrame(surface_frame_name)
+    surf_pos = np.asarray(surface.getPosition())
+    surf_size = np.asarray(surface.getSize()[:3])
+    obj = C.getFrame(obj_frame_name)
+    obj_size = np.asarray(obj.getSize()[:3])
+    half_x = max(surf_size[0] / 2.0 - obj_size[0] / 2.0 - margin, 0.0)
+    half_y = max(surf_size[1] / 2.0 - obj_size[1] / 2.0 - margin, 0.0)
+    if half_x <= 0 or half_y <= 0:
+        return None
+    x = surf_pos[0] + random.uniform(-half_x, half_x)
+    y = surf_pos[1] + random.uniform(-half_y, half_y)
+    z = surf_pos[2] + surf_size[2] / 2.0 + obj_size[2] / 2.0
+    return ((x, y, z), (1.0, 0.0, 0.0, 0.0))
+
+
+##### Save / restore world state #####
+
+class ConfigSaver(object):
+    def __init__(self, C):
+        self.C = C
+        self.joint_names = list(C.getJointNames())
+        self.joint_state = np.asarray(C.getJointState()).copy()
+        self.frame_names = [f.name for f in C.getFrames()]
+        self.frame_poses = {
+            name: (tuple(C.getFrame(name).getPosition()), tuple(C.getFrame(name).getQuaternion()))
+            for name in self.frame_names
+        }
+
+    def restore(self):
+        for name, (point, quat) in self.frame_poses.items():
+            f = self.C.getFrame(name)
+            if f is None:
+                continue
+            f.setPosition(point)
+            f.setQuaternion(quat)
+        self.C.setJointState(self.joint_state, self.joint_names)
+
+
+def save_world(C):
+    return ConfigSaver(C)
+
+
+def restore_world(saver):
+    saver.restore()
+
+
+##### Misc, generic helpers (no RAI dependency; kept local so this module doesn't need pybullet) #####
+
+def elapsed_time(start_time):
+    return time.time() - start_time
+
+
+def irange(start, end=None, step=1):
+    if end is None:
+        end, start = start, 0
+    n = start
+    while n < end:
+        yield n
+        n += step
+
+
+def all_close(a, b, atol=1e-6, rtol=0.):
+    assert len(a) == len(b)
+    return np.allclose(a, b, atol=atol, rtol=rtol)
+
+
+def remove_redundant(path, tolerance=1e-3):
+    assert path
+    new_path = [path[0]]
+    for conf in path[1:]:
+        if not all_close(new_path[-1], conf, atol=tolerance):
+            new_path.append(conf)
+    return new_path
+
+
+def get_unit_vector(vec):
+    vec = np.asarray(vec, dtype=float)
+    norm = np.linalg.norm(vec)
+    if norm == 0:
+        return vec
+    return vec / norm

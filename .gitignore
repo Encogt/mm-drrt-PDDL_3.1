@@ -9,3 +9,4 @@ experiments/run_*
 test_multirobot_t2
 *.mp4
 __pycache__/
+z.log.global

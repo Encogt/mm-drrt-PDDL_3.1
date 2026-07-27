@@ -1,5 +1,6 @@
 numpy
 pybullet
+robotic
 scipy
 matplotlib
 networkx
