@@ -1,5 +1,5 @@
 (define (domain mm-drrt-manipulation)
-  (:requirements :strips :typing :durative-actions :duration-inequalities :object-fluents)
+  (:requirements :strips :typing :durative-actions :duration-inequalities)
 
   (:types
     robot
@@ -14,10 +14,7 @@
     (obj-clear ?m - movable-obj)
     (surface-accessible ?f - fixed-obj)
     (robot-can-reach ?r - robot ?f - fixed-obj)
-  )
-
-  (:functions
-    (obj-location ?m - movable-obj) - fixed-obj
+    (obj-location ?m - movable-obj ?f - fixed-obj)
   )
 
   (:durative-action transit
@@ -25,7 +22,7 @@
     :duration (= ?duration 10)
     :condition (and
       (at start (robot-free ?r))
-      (at start (= (obj-location ?m) ?from))
+      (at start (obj-location ?m ?from))
       (at start (obj-clear ?m))
       (over all (surface-accessible ?from))
       (over all (robot-can-reach ?r ?from))
@@ -33,6 +30,7 @@
     :effect (and
       (at start (not (robot-free ?r)))
       (at start (not (obj-clear ?m)))
+      (at start (not (obj-location ?m ?from)))
       (at end   (holding ?r ?m))
     )
   )
@@ -49,7 +47,7 @@
       (at end (robot-free ?r))
       (at end (not (holding ?r ?m)))
       (at end (obj-clear ?m))
-      (at end (assign (obj-location ?m) ?to))
+      (at end (obj-location ?m ?to))
     )
   )
 

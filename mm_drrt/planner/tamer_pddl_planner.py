@@ -1,11 +1,11 @@
 """
-Tamer (UPF) PDDL 3.1 Planner Integration for MM-dRRT.
+Tamer (UPF) PDDL 2.1 Planner Integration for MM-dRRT.
 
 Solves the problem directly as a Unified Planning Framework Problem via the
-Tamer engine, which natively supports the domain's PDDL 3.1 object fluent
-(obj-location) plus durative actions -- see PDDL_INTEGRATION.md. This is tried
-first; main.py falls back to classical Fast Downward planning
-(mm_drrt.planner.pddl_planner.PDDLPlanner) if it fails.
+Tamer engine, which natively supports the domain's durative actions (see
+mm_drrt/planner/pddl_domain.py). This is tried first; main.py falls back to
+classical Fast Downward planning (mm_drrt.planner.pddl_planner.PDDLPlanner)
+if it fails.
 """
 
 import unified_planning as up
@@ -49,7 +49,7 @@ class TamerParseError(TamerPlannerError):
 
 class TamerPDDLPlanner:
     """
-    Tamer-based PDDL 3.1 planner orchestrator for MM-dRRT.
+    Tamer-based PDDL 2.1 planner orchestrator for MM-dRRT.
 
     This class handles:
     1. Problem generation from environment (UPF Problem, via pddl_problem_generator)

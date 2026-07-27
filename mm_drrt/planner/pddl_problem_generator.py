@@ -4,7 +4,7 @@ PDDL Problem Generator for MM-dRRT
 Converts MM-dRRT environment states into PDDL problem instances and maintains
 bidirectional mapping between PyBullet IDs and PDDL names.
 
-Supports PDDL 3.1 object fluents (obj-location) combined with durative actions.
+Supports PDDL 2.1 durative actions with boolean fluents (see pddl_domain.py).
 """
 
 from unified_planning.shortcuts import *
@@ -49,7 +49,7 @@ def _resolve_args(predicate_args, mapper, problem):
 
 def generate_problem(env, save_to_file=False, transit_duration=10, transfer_duration=10):
     """
-    Create a PDDL 3.1 temporal problem instance from the environment.
+    Create a PDDL 2.1 temporal problem instance from the environment.
 
     Args:
         env: MM-dRRT environment with create_pddl_problem() method
@@ -69,13 +69,10 @@ def generate_problem(env, save_to_file=False, transit_duration=10, transfer_dura
                                             transfer_duration=transfer_duration)
     types           = domain['types']
     boolean_fluents = domain['boolean_fluents']
-    object_fluents  = domain['object_fluents']
     actions         = domain['actions']
 
     for fluent in boolean_fluents:
         problem.add_fluent(fluent, default_initial_value=False)
-    for fluent in object_fluents:
-        problem.add_fluent(fluent)
     for action in actions:
         problem.add_action(action)
 
@@ -89,8 +86,7 @@ def generate_problem(env, save_to_file=False, transit_duration=10, transfer_dura
             problem.add_object(upf_obj)
             mapper.register(pybullet_obj, pddl_name)
 
-    all_fluents = boolean_fluents + object_fluents
-    fluent_map  = {f.name: f for f in all_fluents}
+    fluent_map = {f.name: f for f in boolean_fluents}
 
     # Set initial state
     for predicate_tuple in init_state:
@@ -102,12 +98,7 @@ def generate_problem(env, save_to_file=False, transit_duration=10, transfer_dura
 
         fluent   = fluent_map[predicate_name]
         upf_args = _resolve_args(predicate_args, mapper, problem)
-
-        if fluent.type.is_bool_type():
-            problem.set_initial_value(fluent(*upf_args), True)
-        else:
-            # Object fluent: ('obj-location', m, f) → obj-location(m) = f
-            problem.set_initial_value(fluent(*upf_args[:-1]), upf_args[-1])
+        problem.set_initial_value(fluent(*upf_args), True)
 
     # Set goal
     goal_conditions = []
@@ -120,11 +111,7 @@ def generate_problem(env, save_to_file=False, transit_duration=10, transfer_dura
 
         fluent   = fluent_map[predicate_name]
         upf_args = _resolve_args(predicate_args, mapper, problem)
-
-        if fluent.type.is_bool_type():
-            goal_conditions.append(fluent(*upf_args))
-        else:
-            goal_conditions.append(Equals(fluent(*upf_args[:-1]), upf_args[-1]))
+        goal_conditions.append(fluent(*upf_args))
 
     if len(goal_conditions) == 1:
         problem.add_goal(goal_conditions[0])
@@ -135,7 +122,6 @@ def generate_problem(env, save_to_file=False, transit_duration=10, transfer_dura
         import os
         problem_dir = os.path.join(os.path.dirname(__file__), '../pddl/problems/')
         os.makedirs(problem_dir, exist_ok=True)
-        # PDDLWriter does not support object fluents; write UPF's own representation
         with open(os.path.join(problem_dir, 'problem.txt'), 'w') as f:
             f.write(str(problem))
 
