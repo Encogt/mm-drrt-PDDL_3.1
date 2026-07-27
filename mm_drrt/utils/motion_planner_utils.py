@@ -656,6 +656,11 @@ def connect_to_target(roadmap=[], num_robots=1, start_configs=[], target_configs
         elif roadmap[r].expand_type == 'arm':
             s_configs = start_configs[r][:-1 * len(roadmap[r].expand_configs)]
             t_configs = target_configs[r][:-1 * len(roadmap[r].expand_configs)]
+        else:
+            # No base/arm split: the full config is the robot's state, nothing to slice off.
+            # (Note [:-1 * len(...)] above would break for len==0 anyway: q[:-0] == q[:0] == [].)
+            s_configs = start_configs[r]
+            t_configs = target_configs[r]
         local_path = list(roadmap[r].sub_extend_fn(s_configs, t_configs))[:-1]
         if not local_path: local_path = [start_configs[r]]
         if any(roadmap[r].sub_collision_fn(q) for q in local_path):
@@ -673,6 +678,10 @@ def get_sub_samples(roadmap, sub_samples):
         sub_samples.append(roadmap.expand_configs + roadmap.sub_sample_fn())
     elif roadmap.expand_type == 'arm':
         sub_samples.append(roadmap.sub_sample_fn() + roadmap.expand_configs)
+    else:
+        # No base/arm split (e.g. a fixed-mount robot with no separate base/arm phases): the
+        # sampled config already represents the robot's full state, nothing to concatenate.
+        sub_samples.append(roadmap.sub_sample_fn())
     return sub_samples
 
 

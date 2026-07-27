@@ -6,6 +6,8 @@ from mm_drrt.utils.rai_utils import connect, disconnect, set_camera_pose, refres
 
 from examples.envs.example_single_robot_rai_env import ExampleSingleRobotRaiEnvironment, \
     ExampleSingleRobotCameraSetup
+from examples.envs.example_two_robots_rai_env import ExampleTwoRobotsRaiEnvironment, \
+    ExampleTwoRobotsRaiCameraSetup
 from mm_drrt.planner.rai_task_planner import PlanSkeleton
 from mm_drrt.utils.rai_motion_planner_utils import replay_composite_path
 from experiments.data_saver import data_saver
@@ -39,6 +41,10 @@ if opt.env_type == 'exp_single_robot_rai':
     set_camera_pose(C, camera_point=ExampleSingleRobotCameraSetup[0], target_point=ExampleSingleRobotCameraSetup[1])
     env = ExampleSingleRobotRaiEnvironment(num_robots=opt.num_robots, num_objs=opt.num_objs, arm=opt.arm,
                                            grasp_type=opt.grasp_type, sim_id=C, seed=opt.seed)
+elif opt.env_type == 'exp_two_robots_rai':
+    set_camera_pose(C, camera_point=ExampleTwoRobotsRaiCameraSetup[0], target_point=ExampleTwoRobotsRaiCameraSetup[1])
+    env = ExampleTwoRobotsRaiEnvironment(num_robots=opt.num_robots, num_objs=opt.num_objs, arm=opt.arm,
+                                         grasp_type=opt.grasp_type, sim_id=C, seed=opt.seed)
 else:
     raise ValueError('Unsupported env_type for the RAI POC: {}'.format(opt.env_type))
 
@@ -95,8 +101,20 @@ data_saver(composite_path, opt)
 if opt.use_gui:
     robots = list(env.robots.values())
     joints = env.get_joints(robots)
-    # Single-object POC: whatever gets released was always headed for the last fixed obj (table1).
-    release_targets = [env.f_objs[-1] for _ in robots]
-    replay_composite_path(C, composite_path, joints, release_targets)
+    # Whatever a robot released was headed for that robot's own last transfer target -- derive it
+    # from the plan instead of assuming a single shared destination (true for the single-robot
+    # scenario, false for a relay where each robot has its own hand-off/goal surface).
+    release_targets = []
+    for r in robots:
+        to_f = None
+        for name in action_orders[r]:
+            a_type, a_robot, a_m_obj, a_from, a_to = plan[name]
+            if a_type == 'transfer':
+                to_f = a_to
+        release_targets.append(to_f)
+    gripper_frames = [getattr(getattr(r, 'spec', None), 'gripper_frame', None) for r in robots]
+    if all(g is None for g in gripper_frames):
+        gripper_frames = None  # single-mobile-robot scenario: replay_composite_path's own default
+    replay_composite_path(C, composite_path, joints, release_targets, gripper_frames=gripper_frames)
     input("Simulation complete. Press Enter to close...")
 disconnect(C)

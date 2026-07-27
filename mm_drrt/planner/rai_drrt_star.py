@@ -13,6 +13,32 @@ from mm_drrt.utils.motion_planner_utils import OptimalNode, get_angle, \
 
 from mm_drrt.utils.rai_motion_planner_utils import get_inter_robots_collision_fn
 
+
+def _advance_past_trivial(sub_q, sub_goals, subprob_id, goals, joint_dim, roadmaps):
+    """update_subprob_id, but also auto-skips any newly-entered placeholder roadmap segment whose
+    initial_conf == final_conf (get_trivial_roadmap() in rai_motion_planner_utils.py -- stands in
+    for a fixed-arm robot's non-existent base phase, so every 3-roadmap-per-action group the
+    multi-robot indexing assumes still has 3 entries). Those roadmaps have exactly one vertex and
+    no edges, so the normal search loop can never find a *different* neighbor to explore there
+    (get_random_neighbor_vertex always returns the same isolated vertex) and would spin forever.
+    sub_q_last stays valid as "current position" across a whole chain of these, since
+    get_trivial_roadmap() always uses the SAME conf (a robot's carry_conf) for both its
+    initial_conf and final_conf, matching the neighboring real segments' boundary value."""
+    sub_q_last, sub_goals = update_subprob_id(sub_q, sub_goals, subprob_id, goals, joint_dim, roadmaps)
+    advanced = True
+    while advanced:
+        advanced = False
+        for r in range(len(roadmaps)):
+            if subprob_id[r] >= len(roadmaps[r]):
+                continue
+            rm = roadmaps[r][subprob_id[r]]
+            if (rm.initial_conf == rm.final_conf and sub_q_last[r] == sub_goals[r]
+                    and len(roadmaps[r]) - 1 > subprob_id[r]):
+                subprob_id[r] += 1
+                sub_goals[r] = get_sub_q_list(get_substarts_subgoals(goals, subprob_id, joint_dim), len(roadmaps))[r]
+                advanced = True
+    return sub_q_last, sub_goals
+
 MAX_DISTANCE = 0.0  # unused broad-phase margin in the RAI collision backend; kept for signature compat
 
 class dRRTStar:
@@ -39,7 +65,21 @@ class dRRTStar:
                 goals += roadmap.final_conf
             self.starts.append(starts)
             self.goals.append(goals)
-            self.subprob_id.append(0)
+            # Skip past any LEADING trivial (start==goal) placeholder roadmap segments -- e.g.
+            # get_trivial_roadmap()'s stand-in for a fixed-arm robot's non-existent base phase --
+            # independently per robot, before the search even starts. This has to happen here
+            # rather than only via _advance_past_trivial() during grow(): if EVERY robot's very
+            # first segment happens to be trivial (true whenever every robot's first action is a
+            # fresh pick, as in a relay), no robot can ever produce a q_new different from
+            # sub_q_near (get_random_neighbor_vertex always returns the same isolated vertex for
+            # all of them simultaneously), so the "prevent same" search loop can never break to
+            # begin with -- there is no order-constraint concern in skipping this, since nothing
+            # physical happens for a placeholder segment.
+            start_id = 0
+            while (start_id < len(self.roadmaps[r]) - 1
+                  and self.roadmaps[r][start_id].initial_conf == self.roadmaps[r][start_id].final_conf):
+                start_id += 1
+            self.subprob_id.append(start_id)
 
         self.inter_robots_collision_fn = get_inter_robots_collision_fn(self.robots, self.joints, num_robots=num_robots)
         self.nodes = [OptimalNode(get_substarts_subgoals(self.starts, self.subprob_id, self.joint_dim),
@@ -78,7 +118,14 @@ class dRRTStar:
                     sub_samples = sub_goals
                     sub_q_near = sub_q_last
 
-                while True: # prevent q_new == sub_q_near for all robots (i.e. remains in the same composite node)
+                # get_random_neighbor_vertex(roadmap, q_near) always includes q_near itself as a
+                # candidate, so if q_near's roadmap vertex happens to have zero edges (possible
+                # with a sparse/small roadmap -- more likely with more robots, since every robot's
+                # vertex must independently be non-isolated for this loop to ever break), this spins
+                # forever. Cap it: if no robot's contribution can move off sub_q_near after enough
+                # tries, give up on this sample and let the outer loop draw a fresh one next time.
+                spin_cap_hit = False
+                for _spin in range(2000):
                     q_new = ()
                     for r in range(self.num_robots):
                         if sub_samples[r] == sub_goals[r]:
@@ -93,6 +140,11 @@ class dRRTStar:
                         if use_debug_verbal: print('q_new is the same as sub_q_near')
                     else:
                         break
+                else:
+                    spin_cap_hit = True
+                if spin_cap_hit:
+                    sub_q_last = None
+                    continue
 
                 neighbor_nodes = get_neighbor_vertices(self.nodes, get_subprob(self.roadmaps, self.subprob_id), q_new, self.subprob_id)
                 q_best, local_dist, local_paths = get_q_best(self.nodes, get_subprob(self.roadmaps, self.subprob_id), self.num_robots,
@@ -114,7 +166,7 @@ class dRRTStar:
                     if is_q_new_in_subgoal(get_subprob(self.roadmaps, self.subprob_id), q_new,
                                            get_substarts_subgoals(self.goals, self.subprob_id, self.joint_dim)):
                         if use_debug_verbal: print('Some of robots reached their subgoals.')
-                        sub_q_last, sub_goals = update_subprob_id(q_new, sub_goals, self.subprob_id,
+                        sub_q_last, sub_goals = _advance_past_trivial(q_new, sub_goals, self.subprob_id,
                                                                   self.goals, self.joint_dim, self.roadmaps)
                         start = time.time()
                         is_update_subprob_id = True
@@ -168,7 +220,29 @@ class dRRTStar:
             sub_goals = get_sub_q_list(get_substarts_subgoals(self.goals, self.subprob_id, self.joint_dim), self.num_robots)
             sub_q_near = get_sub_q_near(self.nodes, get_subprob(self.roadmaps, self.subprob_id), sub_goals, self.subprob_id)
             if sub_q_near == sub_goals:
+                # Already at this subprob's goal without ever having to search for it -- e.g. a
+                # trivial start==goal placeholder roadmap (get_trivial_roadmap in
+                # rai_motion_planner_utils.py, used for a fixed-arm robot's non-existent "base"
+                # phase). The normal advance-subprob_id path below only fires after new search
+                # progress; replicate it here (with a zero-length "already there" local path) so
+                # subprob_id still advances instead of stalling here forever.
                 if use_debug_verbal: print('Goal has already reached.')
+                if not is_violate_order_constraints(self.order_constraints, self.subprob_id):
+                    parent_node_index = get_parent_node_index(self.nodes, sub_q_near)
+                    local_paths = [[c] for c in sub_q_near]
+                    node_pose = get_substarts_subgoals(self.goals, self.subprob_id, self.joint_dim)
+                    sub_q_last, sub_goals = _advance_past_trivial(node_pose, sub_goals, self.subprob_id,
+                                                              self.goals, self.joint_dim, self.roadmaps)
+                    self.nodes.append(OptimalNode(node_pose, num_robots=self.num_robots, d=0,
+                                                  parent=self.nodes[parent_node_index],
+                                                  subprob_id=self.subprob_id, path=local_paths,
+                                                  attachments=get_subattachments(self.roadmaps, self.subprob_id, self.nodes)))
+                    if is_goal_in_tree(self.nodes, get_goals(self.goals, self.joint_dim), self.roadmaps, self.subprob_id):
+                        goal_node = get_node_from_tree(self.nodes, get_substarts_subgoals(self.goals, self.subprob_id,
+                                                                                          self.joint_dim), self.subprob_id)
+                        best_paths = goal_node.retrace()
+                        best_path_cost = goal_node.cost
+                        is_found_path = True
             else:
                 if not is_violate_order_constraints(self.order_constraints, self.subprob_id):
                     parent_node_index = get_parent_node_index(self.nodes, sub_q_near)
@@ -188,7 +262,7 @@ class dRRTStar:
                                                           self.nodes[parent_node_index].config,
                                                           get_substarts_subgoals(self.goals, self.subprob_id, self.joint_dim))
                         node_pose = get_substarts_subgoals(self.goals, self.subprob_id, self.joint_dim)
-                        sub_q_last, sub_goals = update_subprob_id(get_substarts_subgoals(self.goals, self.subprob_id, self.joint_dim),
+                        sub_q_last, sub_goals = _advance_past_trivial(get_substarts_subgoals(self.goals, self.subprob_id, self.joint_dim),
                                                                   sub_goals, self.subprob_id, self.goals, self.joint_dim, self.roadmaps)
                         # print('subprob_id', self.subprob_id)
                         self.nodes.append(OptimalNode(node_pose, num_robots=self.num_robots, d=dist_to_goal,

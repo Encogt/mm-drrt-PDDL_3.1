@@ -13,6 +13,7 @@ import time
 import numpy as np
 
 from mm_drrt.utils import rai_utils as ru
+from mm_drrt.planner.prm import DegreePRM
 from mm_drrt.planner.prm import prm
 from mm_drrt.utils.motion_planner_utils import get_max_length_list
 
@@ -20,7 +21,43 @@ GRASP_LENGTH = 0.03
 APPROACH_DISTANCE = 0.1 + GRASP_LENGTH
 
 
-def replay_composite_path(robot, composite_path, joints, release_targets, pause_time=0.02):
+def get_trivial_roadmap(conf, attachments=[]):
+    """A degenerate, no-op roadmap: start == goal == conf, nothing to actually plan. The
+    multi-robot dRRT* machinery (task_planner_utils.py's assign_order_constraints, subprob_id
+    indexing, etc.) hardcodes "3 roadmap segments per action" -- base motion, arm approach, arm
+    retrieval, matching the mobile-base scenario's compute_path -- so a fixed-arm env (no base
+    phase at all) must still contribute a 3rd placeholder roadmap per action rather than just 2,
+    or that indexing arithmetic silently misaligns between robots.
+
+    conf must be a real len(joints)-dimensional tuple, not (): get_substarts_subgoals() and
+    friends slice the flat per-robot conf history with a *fixed stride* of
+    dRRTStar.joint_dim = len(env.get_joints(robots)[0]) per subprob_id step -- a 0-length
+    placeholder would desync that indexing for every step after it. The robot's own carry_conf is
+    a natural choice (a real, definitely-safe conf); "base motion" is from carry to carry.
+
+    attachments must match whatever the robot is actually holding while idling through this
+    placeholder (e.g. [m_obj] for the gap between a transit that just grasped and the transfer
+    that carries it onward) -- NOT always empty. get_subattachments() (motion_planner_utils.py,
+    shared/unchanged) looks up "the segment just completed" as roadmaps[r][subprob_id[r] - 1]
+    whenever subprob_id[r] changed since the last tree node, assuming that always means a single
+    real step. _advance_past_trivial() (rai_drrt_star.py) can legitimately jump subprob_id by 2 in
+    one go to skip over a trivial segment, which makes that lookback land ON the trivial segment
+    instead of the real one before it -- so if this roadmap doesn't carry the correct holding
+    state itself, get_subattachments() under-reports it (attach happens late, visibly desynced
+    from the arm during replay) for that one transition.
+
+    Since start==goal, PRM.__call__ (external/pybullet_planning/motion/motion_planners/prm.py)
+    returns immediately without ever needing real sample/distance/extend/collision behavior --
+    these are unreachable no-ops."""
+    roadmap = DegreePRM(conf, conf, lambda: conf, lambda q1, q2: 0.0, lambda q1, q2: iter([conf]),
+                       lambda q, verbose=False: False, samples=[conf], target_degree=0,
+                       expand_type=None, expand_configs=(), attachments=attachments)
+    roadmap.final_conf = conf
+    heuristic_val = {roadmap.vertices[conf]: 0.0}
+    return roadmap, heuristic_val
+
+
+def replay_composite_path(C, composite_path, joints, release_targets, gripper_frames=None, pause_time=0.02):
     """Step C through a solved composite_path (list of OptimalNode, from PlanSkeleton.plan_refinement)
     in the live viewer. Neither this pipeline nor the pybullet original animates the plan on its own
     -- the pybullet version needs a separate experiments/visualizer.py run against the pickled
@@ -30,8 +67,12 @@ def replay_composite_path(robot, composite_path, joints, release_targets, pause_
     release_targets: per-robot frame name to reattach a carried object to once it's released (the
     composite_path only records the grasped object's name, not its destination surface, so the
     caller supplies it -- for this single-object POC it's simply the destination table).
+    gripper_frames: per-robot gripper frame name to attach a carried object to. Defaults to
+    ru.GRIPPER_FRAME for every robot (the single-mobile-robot scenario).
     """
     num_robots = len(joints)
+    if gripper_frames is None:
+        gripper_frames = [ru.GRIPPER_FRAME] * num_robots
     currently_attached = [None] * num_robots
     for node in composite_path:
         for j in range(get_max_length_list(node.sub_local_paths)):
@@ -40,16 +81,16 @@ def replay_composite_path(robot, composite_path, joints, release_targets, pause_
                 if not path_r:
                     continue
                 q = path_r[-1] if len(path_r) <= j else path_r[j]
-                ru.set_joint_positions(robot, joints[r], q)
+                ru.set_joint_positions(C, joints[r], q)
             for r in range(num_robots):
                 held = node.attachments[r] if node.attachments else None
                 if held and not currently_attached[r]:
-                    robot.attach(ru.GRIPPER_FRAME, held)
+                    C.attach(gripper_frames[r], held)
                     currently_attached[r] = held
                 elif not held and currently_attached[r]:
-                    robot.attach(release_targets[r], currently_attached[r])
+                    C.attach(release_targets[r], currently_attached[r])
                     currently_attached[r] = None
-            robot.view(False)
+            C.view(False)
             time.sleep(pause_time)
 
 
@@ -109,8 +150,9 @@ def base_motion(robot, base_start, base_goal, teleport=False, obstacles=[], atta
 
 
 def arm_retrieval_motion(robot, arm, type, grasp, start, goal, obstacles=[], attachments=[], custom_limits={},
-                         num_samples=100, expand_type=None, expand_configs=None, use_debug=False):
-    arm_joints = ru.ARM_JOINTS
+                         num_samples=100, expand_type=None, expand_configs=None, use_debug=False,
+                         arm_joints=None):
+    arm_joints, _, _, _ = ru._spec_of(robot, arm_joints)
     ru.set_joint_positions(robot, arm_joints, start)
     resolutions = 0.05 ** np.ones(len(arm_joints))
     for _ in range(5):
@@ -201,19 +243,22 @@ def get_stable_gen(robot, collisions=True, **kwargs):
     return gen
 
 
-def get_ik_fn(robot, custom_limits={}, collisions=True, collision_objs=[], use_debug=False):
+def get_ik_fn(robot, custom_limits={}, collisions=True, collision_objs=[], use_debug=False, arm_joints=None):
     obstacles = collision_objs if collisions else []
+    arm_joints, _, _, _ = ru._spec_of(robot, arm_joints)
 
     def fn(arm, obj, pose, grasp, base_conf):
         pose.assign()
-        base_conf.assign()
-        ru.set_joint_positions(robot, ru.ARM_JOINTS, grasp.carry)
-        grasp_conf = ru.rai_ik(robot, base_conf.values, grasp, custom_limits=custom_limits)
+        if base_conf is not None:
+            base_conf.assign()
+        ru.set_joint_positions(robot, arm_joints, grasp.carry)
+        base_values = base_conf.values if base_conf is not None else None
+        grasp_conf = ru.rai_ik(robot, base_values, grasp, custom_limits=custom_limits, arm_joints=arm_joints)
         if grasp_conf is None:
             if use_debug:
                 print('Grasp IK failure: no IK solution')
             return (None, None)
-        ru.set_joint_positions(robot, ru.ARM_JOINTS, grasp_conf)
+        ru.set_joint_positions(robot, arm_joints, grasp_conf)
         # Validate both self-collision (rai_ik solves with enableCollisions=False, so a solution can
         # be self-colliding, e.g. wrist twisted into the forearm) and collision against obstacles.
         # obj itself is excluded: at the grasp conf the gripper is expected to touch/enclose it.
@@ -232,11 +277,11 @@ def get_ik_fn(robot, custom_limits={}, collisions=True, collision_objs=[], use_d
 
 
 def get_arm_motion_fn(robot, custom_limits={}, collisions=True, collision_objs=[], num_samples=100,
-                      expand_type=None, expand_configs=None, use_debug=False):
+                      expand_type=None, expand_configs=None, use_debug=False, arm_joints=None):
     obstacles = collision_objs if collisions else []
+    arm_joints, _, _, _ = ru._spec_of(robot, arm_joints)
 
     def fn(arm, obj, grasp, approach_conf, grasp_conf, attachments=[]):
-        arm_joints = ru.ARM_JOINTS
         roadmap, heuristic_val = None, None
         resolutions = 0.05 ** np.ones(len(arm_joints))
         ru.set_joint_positions(robot, arm_joints, grasp.carry)
@@ -320,18 +365,47 @@ def get_ik_ir_gen(robot, gripper, max_attempts=25, learned=True, use_debug=False
     return gen
 
 
+def get_fixed_arm_ik_ir_gen(robot, max_attempts=25, use_debug=False, **kwargs):
+    """Fixed-arm analogue of get_ik_ir_gen, for a robot with no base joints (the arm is bolted
+    down, so there's nothing to search over the way get_ir_sampler searches candidate base poses
+    -- the only real search is the grasp IK itself, which rai_ik already random-restarts
+    internally). Still yields the same (bq, approach_conf, grasp_conf) 3-tuple shape get_ik_ir_gen
+    does -- bq is a trivial Conf over zero joints -- so callers (subgoal_sampling, compute_path)
+    don't need a different code path for the fixed-arm vs mobile-base scenario."""
+    ik_fn = get_ik_fn(robot, use_debug=use_debug, **kwargs)
+
+    def gen(arm, obj, pose, grasp):
+        bq = ru.Conf(robot, [], ())
+        for attempts in range(max_attempts):
+            if use_debug:
+                print('attempts', attempts)
+            ik_outputs = ik_fn(arm, obj, pose, grasp, None)
+            if ik_outputs is None or ik_outputs[0] is None:
+                continue
+            if use_debug:
+                print('IK attempts:', attempts)
+            yield (bq,) + ik_outputs
+            return
+        yield None
+
+    return gen
+
+
 def get_gripper(robot_id, arm='left', visual=True):
-    return ru.GRIPPER_FRAME
+    _, gripper_frame, _, _ = ru._spec_of(robot_id)
+    return gripper_frame
 
 
 def get_configuration(robot, name):
+    arm_joints, _, base_joints, _ = ru._spec_of(robot)
     if name == 'base':
-        return ru.get_joint_positions(robot, ru.BASE_JOINTS)
-    return ru.get_joint_positions(robot, ru.ARM_JOINTS)
+        return ru.get_joint_positions(robot, base_joints)
+    return ru.get_joint_positions(robot, arm_joints)
 
 
 def get_arm_positions(robot, arm):
-    return ru.get_joint_positions(robot, ru.ARM_JOINTS)
+    arm_joints, _, _, _ = ru._spec_of(robot)
+    return ru.get_joint_positions(robot, arm_joints)
 
 
 def sub_plan_joint_motion(robot, joints, end_conf, obstacles=[], attachments=[],
@@ -357,17 +431,52 @@ def sub_plan_joint_motion(robot, joints, end_conf, obstacles=[], attachments=[],
               debug_roadmap_fn=debug_2d_sub_roadmap, **kwargs)
 
 
-def get_inter_robots_collision_fn(robots, joints, num_robots=1, **kwargs):
+def get_inter_robots_collision_fn(robots, joints, num_robots=1, tolerance=None, **kwargs):
+    """dRRT*'s composite-state collision check between distinct robots. Multiple robots can share
+    one ry.Config (the fixed dual-arm scenario) or each have their own; either way, every robot
+    that's a RaiRobot carries its own spec.frame_prefix, which is how a colliding frame pair gets
+    attributed to two DIFFERENT robots (a pair sharing one robot's prefix is that robot's own
+    self-collision, already checked elsewhere -- not this function's job)."""
+    if tolerance is None:
+        tolerance = ru.COLLISION_TOLERANCE
+    prefixes = [(r.spec.frame_prefix if isinstance(r, ru.RaiRobot) else None) for r in robots]
+
+    def _cross_robot_pair(a, b):
+        for i in range(num_robots):
+            for j in range(num_robots):
+                if i == j or not prefixes[i] or not prefixes[j]:
+                    continue
+                if a.startswith(prefixes[i]) and b.startswith(prefixes[j]):
+                    return i, j
+        return None
+
     def drrt_collision_fn(q, mode='boolean', skip_index=[]):
         for r in range(num_robots):
             ru.set_joint_positions(robots[r], joints[r], q[r])
 
+        seen, collisions = set(), []
+        for r in range(num_robots):
+            C = ru._config_of(robots[r])
+            if id(C) in seen:
+                continue
+            seen.add(id(C))
+            C.computeCollisions()
+            collisions.extend(C.getCollisions())
+
         if mode == 'boolean':
-            for r in range(num_robots - 1):
-                for r_prime in range(r + 1, num_robots):
-                    if robots[r] is robots[r_prime]:
-                        continue  # same shared Config: no cross-robot geometry to check in the POC
+            for a, b, pen in collisions:
+                if pen >= -tolerance:
+                    continue
+                if _cross_robot_pair(a, b):
+                    return True
             return False
         elif mode == 'index':
-            return []
+            collision_robot_index = []
+            for a, b, pen in collisions:
+                if pen >= -tolerance:
+                    continue
+                pair = _cross_robot_pair(a, b)
+                if pair and pair[0] not in skip_index and pair[1] not in skip_index:
+                    collision_robot_index.extend(pair)
+            return list(np.unique(collision_robot_index))
     return drrt_collision_fn

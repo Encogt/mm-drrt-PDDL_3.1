@@ -26,12 +26,14 @@ BASE_JOINTS = ['ranger_transX', 'ranger_transY', 'ranger_rot']
 ARM_JOINTS = [f'l_panda_joint{i}' for i in range(1, 8)]
 GRIPPER_FRAME = 'l_gripper'
 ROBOT_SCENARIO = 'scenarios/panda_ranger.g'
-ROBOT_FRAME_PREFIXES = ('ranger_', 'l_panda', 'l_finger', 'l_palm', 'l_gripper')
+ROBOT_FRAME_PREFIXES = ('ranger_', 'l_panda', 'l_finger', 'l_palm', 'l_gripper',
+                        'r_panda', 'r_finger', 'r_palm', 'r_gripper')
 
 # Reasonable folded/carry arm posture (within joint limits), used as the "resting" configuration
 # before/after a pick or place, analogous to PR2's TOP_HOLDING_LEFT_ARM / SIDE_HOLDING_LEFT_ARM.
 # This is Franka's standard self-collision-free "ready" pose (verified: no self-collision, and
-# clears a table at the base standoff radii uniform_pose_generator samples).
+# clears a table at the base standoff radii uniform_pose_generator samples). Also verified
+# self-collision-free -- and cross-arm-collision-free -- for the fixed dual-arm scenario below.
 PANDA_CARRY_CONF = (0.0, -0.785, 0.0, -2.356, 0.0, 1.571, 0.785)
 
 DEFAULT_ARM_RESOLUTION = math.radians(3)
@@ -41,6 +43,62 @@ COLLISION_TOLERANCE = 5e-3
 
 def is_robot_frame(name):
     return name.startswith(ROBOT_FRAME_PREFIXES)
+
+
+##### Multi-robot identity (see plan: RaiRobot wrapper) #####
+
+class ArmSpec(object):
+    """Everything that's specific to one arm sharing a Config with other robots: its own joint
+    names, gripper reference frame, collision-frame prefix (for inter-robot collision
+    attribution), and carry/rest posture. base_joints is empty for a fixed-mount arm."""
+
+    def __init__(self, arm_joints, gripper_frame, frame_prefix, carry_conf, base_joints=()):
+        self.arm_joints = list(arm_joints)
+        self.gripper_frame = gripper_frame
+        self.frame_prefix = frame_prefix
+        self.carry_conf = tuple(carry_conf)
+        self.base_joints = list(base_joints)
+
+
+class RaiRobot(object):
+    """Identifies one robot/arm sharing a ry.Config with others. mm_drrt's multi-robot machinery
+    (action_orders, robot_plans in task_planner_utils.py) uses 'robot' as a dict key, which
+    requires each robot to be a distinct hashable object -- but two arms on one Config can't
+    both just *be* that Config (self.robots[0] is self.robots[1] would collapse to one key).
+    RaiRobot gives each arm its own identity (default identity-based __eq__/__hash__) while
+    still carrying a reference to the shared Config and this arm's ArmSpec."""
+
+    def __init__(self, C, spec: ArmSpec):
+        self.C = C
+        self.spec = spec
+
+    def __repr__(self):
+        return 'RaiRobot({})'.format(self.spec.frame_prefix or 'default')
+
+
+def _config_of(robot):
+    """robot is either a bare ry.Config (the single-mobile-robot scenario, where the Config IS
+    the robot identity) or a RaiRobot wrapping one (the multi-arm scenario). Unwrap to the
+    actual Config either way."""
+    return robot.C if isinstance(robot, RaiRobot) else robot
+
+
+def _spec_of(robot, arm_joints=None, gripper_frame=None, base_joints=None, carry_conf=None):
+    """Resolve the (arm_joints, gripper_frame, base_joints, carry_conf) to use for this robot:
+    explicit arguments win; otherwise use robot.spec if it's a RaiRobot; otherwise fall back to
+    the single-mobile-robot module constants (today's default behavior, unchanged)."""
+    spec = robot.spec if isinstance(robot, RaiRobot) else None
+    return (
+        arm_joints if arm_joints is not None else (spec.arm_joints if spec else ARM_JOINTS),
+        gripper_frame if gripper_frame is not None else (spec.gripper_frame if spec else GRIPPER_FRAME),
+        base_joints if base_joints is not None else (spec.base_joints if spec else BASE_JOINTS),
+        carry_conf if carry_conf is not None else (spec.carry_conf if spec else PANDA_CARRY_CONF),
+    )
+
+
+TWO_ARM_SCENARIO = 'scenarios/pandasTable.g'
+LEFT_ARM = ArmSpec([f'l_panda_joint{i}' for i in range(1, 8)], 'l_gripper', 'l_', PANDA_CARRY_CONF)
+RIGHT_ARM = ArmSpec([f'r_panda_joint{i}' for i in range(1, 8)], 'r_gripper', 'r_', PANDA_CARRY_CONF)
 
 
 ##### Session #####
@@ -79,6 +137,7 @@ _joint_index_cache = {}
 
 
 def _joint_indices(C, joint_names):
+    C = _config_of(C)
     key = id(C)
     all_names = _joint_index_cache.get(key)
     if all_names is None or all_names != list(C.getJointNames()):
@@ -88,15 +147,18 @@ def _joint_indices(C, joint_names):
 
 
 def get_joint_positions(C, joint_names):
+    C = _config_of(C)
     idx = _joint_indices(C, joint_names)
     return tuple(np.asarray(C.getJointState())[idx])
 
 
 def set_joint_positions(C, joint_names, values):
+    C = _config_of(C)
     C.setJointState(np.asarray(values, dtype=float), list(joint_names))
 
 
 def get_joint_limits(C, joint_names):
+    C = _config_of(C)
     idx = _joint_indices(C, joint_names)
     limits = C.getJointLimits()
     lower = np.asarray(limits[0])[idx]
@@ -117,7 +179,7 @@ def get_custom_limits(C, joint_names, custom_limits={}):
 
 class Conf(object):
     def __init__(self, C, joint_names, values=None, init=False):
-        self.C = C
+        self.C = _config_of(C)
         self.joints = list(joint_names)
         if values is None:
             values = get_joint_positions(C, joint_names)
@@ -135,10 +197,10 @@ class Pose(object):
     _num = 0
 
     def __init__(self, C, frame_name, value=None, support=None, init=False):
-        self.C = C
+        self.C = _config_of(C)
         self.frame_name = frame_name
         if value is None:
-            f = C.getFrame(frame_name)
+            f = self.C.getFrame(frame_name)
             value = (tuple(f.getPosition()), tuple(f.getQuaternion()))
         self.value = value
         self.support = support
@@ -169,10 +231,10 @@ class Grasp(object):
         self.grasp_width = 0.0
 
     def attach(self, C, gripper_frame=GRIPPER_FRAME):
-        C.attach(gripper_frame, self.obj_frame_name)
+        _config_of(C).attach(gripper_frame, self.obj_frame_name)
 
     def detach(self, C, new_parent_frame):
-        C.attach(new_parent_frame, self.obj_frame_name)
+        _config_of(C).attach(new_parent_frame, self.obj_frame_name)
 
     def __repr__(self):
         return 'g({})'.format(self.grasp_type)
@@ -236,7 +298,15 @@ def check_collisions(C, obstacles=[], attachments=[], self_collisions=True, tole
     """True if the CURRENT config state has any disallowed collision: robot self-collision (if
     self_collisions), or robot/attached-object penetrating a named obstacle frame. Does not touch
     joint state -- callers set it first. Shared by get_collision_fn (per-sample, PRM-facing) and
-    rai_ik / get_ik_fn (so IK solutions are validated for self-collision too, not just obstacles)."""
+    rai_ik / get_ik_fn (so IK solutions are validated for self-collision too, not just obstacles).
+
+    Note for the multi-arm scenario: is_robot_frame() doesn't distinguish which arm a frame
+    belongs to, so if arm A's sampled pose overlaps arm B's *current* pose, this reports it as
+    a "self-collision" (mislabeled, but functionally correct -- it still blocks the invalid
+    configuration). Real arm-vs-arm attribution (for dRRT*'s composite search, which explores
+    combinations never tested during each arm's own roadmap construction) is
+    get_inter_robots_collision_fn in rai_motion_planner_utils.py."""
+    C = _config_of(C)
     obstacle_names = set(obstacles)
     attached_names = set(attachments)
     C.computeCollisions()
@@ -294,6 +364,7 @@ def check_initial_end(start_conf, end_conf, collision_fn, verbose=True):
 
 
 def pairwise_collision(C, name_a, name_b, tolerance=COLLISION_TOLERANCE):
+    C = _config_of(C)
     C.computeCollisions()
     for a, b, pen in C.getCollisions():
         if pen >= -tolerance:
@@ -305,6 +376,7 @@ def pairwise_collision(C, name_a, name_b, tolerance=COLLISION_TOLERANCE):
 
 def robot_obstacle_collision(C, obstacle_names, tolerance=COLLISION_TOLERANCE):
     """True if any robot frame currently penetrates any of the named obstacle frames."""
+    C = _config_of(C)
     obstacle_names = set(obstacle_names)
     C.computeCollisions()
     for a, b, pen in C.getCollisions():
@@ -330,13 +402,26 @@ def plan_direct_joint_motion(C, joint_names, end_conf, obstacles=[], attachments
 
 ##### Grasp-pose IK via KOMO #####
 
-def rai_ik(C, base_conf, grasp, custom_limits={}, view=False, max_attempts=6):
-    """Fixes the base at base_conf, solves for arm joint values that bring GRIPPER_FRAME into a
-    grasp of grasp.obj_frame_name. Returns an arm conf tuple, or None if infeasible."""
-    set_joint_positions(C, BASE_JOINTS, base_conf)
-    C.selectJoints(ARM_JOINTS)
+def rai_ik(robot, base_conf, grasp, custom_limits={}, view=False, max_attempts=6,
+          arm_joints=None, gripper_frame=None, base_joints=None):
+    """Fixes the base at base_conf (skipped if this robot has no base joints -- base_conf may be
+    None in that case), solves for arm joint values that bring the gripper frame into a grasp of
+    grasp.obj_frame_name. Returns an arm conf tuple, or None if infeasible.
+
+    arm_joints/gripper_frame/base_joints default to robot.spec (if robot is a RaiRobot) or the
+    single-mobile-robot module constants otherwise -- existing single-robot callers don't need to
+    change."""
+    C = _config_of(robot)
+    arm_joints, gripper_frame, base_joints, _ = _spec_of(robot, arm_joints, gripper_frame, base_joints)
+    if base_joints:
+        set_joint_positions(C, base_joints, base_conf)
+    # Restore to the config's FULL original joint set afterwards, not just this robot's own
+    # (base_joints + arm_joints) -- selectJoints changes which joints the whole Config considers
+    # active, and for the multi-arm scenario other robots' joints share this same Config.
+    original_joints = list(C.getJointNames())
+    C.selectJoints(arm_joints)
     try:
-        lower, upper = get_custom_limits(C, ARM_JOINTS, custom_limits)
+        lower, upper = get_custom_limits(C, arm_joints, custom_limits)
         for attempt in range(max_attempts):
             # enableCollisions + a soft accumulatedCollisions penalty steers the solver away from
             # self- and table-colliding solutions (a plain negDistance/scalarProduct solve regularly
@@ -346,13 +431,13 @@ def rai_ik(C, base_conf, grasp, custom_limits={}, view=False, max_attempts=6):
             komo = ry.KOMO(C, phases=1, slicesPerPhase=1, kOrder=0, enableCollisions=True)
             komo.addControlObjective([], 0, 1e-1)
             komo.addObjective([1], ry.FS.accumulatedCollisions, [], ry.OT.sos, [3e1])
-            komo.addObjective([1], ry.FS.negDistance, [GRIPPER_FRAME, grasp.obj_frame_name],
+            komo.addObjective([1], ry.FS.negDistance, [gripper_frame, grasp.obj_frame_name],
                               ry.OT.eq, [1e1])
             if grasp.grasp_type == 'top':
-                komo.addObjective([1], ry.FS.scalarProductXZ, [GRIPPER_FRAME, grasp.obj_frame_name],
+                komo.addObjective([1], ry.FS.scalarProductXZ, [gripper_frame, grasp.obj_frame_name],
                                   ry.OT.eq, [1e1], [0.0])
             else:
-                komo.addObjective([1], ry.FS.scalarProductXY, [GRIPPER_FRAME, grasp.obj_frame_name],
+                komo.addObjective([1], ry.FS.scalarProductXY, [gripper_frame, grasp.obj_frame_name],
                                   ry.OT.eq, [1e1], [0.0])
             if attempt > 0:
                 x_init = np.random.uniform(lower, upper)
@@ -367,7 +452,7 @@ def rai_ik(C, base_conf, grasp, custom_limits={}, view=False, max_attempts=6):
                     return q
         return None
     finally:
-        C.selectJoints(BASE_JOINTS + ARM_JOINTS)
+        C.selectJoints(original_joints)
 
 
 ##### Grasp generation #####
@@ -395,14 +480,15 @@ def uniform_pose_generator(C, target_xy, min_radius=0.55, max_radius=0.7):
 ##### Frame helpers #####
 
 def remove_frame(C, frame_name):
-    C.delFrame(frame_name)
+    _config_of(C).delFrame(frame_name)
 
 
 def get_frame_position(C, frame_name):
-    return tuple(C.getFrame(frame_name).getPosition())
+    return tuple(_config_of(C).getFrame(frame_name).getPosition())
 
 
 def is_placement(C, obj_frame_name, surface_frame_name, epsilon=0.02):
+    C = _config_of(C)
     obj = C.getFrame(obj_frame_name)
     surface = C.getFrame(surface_frame_name)
     obj_pos = np.asarray(obj.getPosition())
@@ -417,6 +503,7 @@ def is_placement(C, obj_frame_name, surface_frame_name, epsilon=0.02):
 
 
 def sample_placement(C, obj_frame_name, surface_frame_name, margin=0.02):
+    C = _config_of(C)
     surface = C.getFrame(surface_frame_name)
     surf_pos = np.asarray(surface.getPosition())
     surf_size = np.asarray(surface.getSize()[:3])
@@ -436,7 +523,8 @@ def sample_placement(C, obj_frame_name, surface_frame_name, margin=0.02):
 
 class ConfigSaver(object):
     def __init__(self, C):
-        self.C = C
+        self.C = _config_of(C)
+        C = self.C
         self.joint_names = list(C.getJointNames())
         self.joint_state = np.asarray(C.getJointState()).copy()
         self.frame_names = [f.name for f in C.getFrames()]
