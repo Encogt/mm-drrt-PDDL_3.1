@@ -276,6 +276,20 @@ def get_ik_fn(robot, custom_limits={}, collisions=True, collision_objs=[], use_d
     return fn
 
 
+def _path_clips_object(robot, arm_joints, path, obj):
+    """True if some config along path has a robot frame penetrating obj. obj is deliberately left
+    out of the `obstacles` list get_arm_motion_fn's roadmap is built against -- otherwise the final
+    grasp_conf, which is supposed to touch obj, would always register as a collision and get
+    rejected -- but that exclusion applies to every waypoint, not just the last one, so nothing
+    stops the PRM from routing straight through obj's volume on the way there. Called on
+    path[:-1] (the last waypoint, the grasp itself, is expected to touch obj)."""
+    for q in path:
+        ru.set_joint_positions(robot, arm_joints, q[-len(arm_joints):])
+        if ru.robot_obstacle_collision(robot, [obj]):
+            return True
+    return False
+
+
 def get_arm_motion_fn(robot, custom_limits={}, collisions=True, collision_objs=[], num_samples=100,
                       expand_type=None, expand_configs=None, use_debug=False, arm_joints=None):
     obstacles = collision_objs if collisions else []
@@ -307,6 +321,11 @@ def get_arm_motion_fn(robot, custom_limits={}, collisions=True, collision_objs=[
         if approach_path is None:
             if use_debug:
                 print('Approach path failure')
+            return (None, None)
+        if not attachments and _path_clips_object(robot, arm_joints, approach_path[:-1], obj):
+            if use_debug:
+                print('Approach path clips the target object before reaching the grasp pose')
+            ru.set_joint_positions(robot, arm_joints, grasp.carry)
             return (None, None)
         ru.set_joint_positions(robot, arm_joints, approach_conf)
         grasp_path = ru.plan_direct_joint_motion(robot, arm_joints, grasp_conf, attachments=attachments,
