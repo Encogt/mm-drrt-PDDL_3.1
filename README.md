@@ -14,6 +14,11 @@ pip install -r requirements.txt
 python -m main
 ```
 
+The `robotic` package (imported as `ry`) ships a precompiled extension that requires a few system shared libraries. On Debian/Ubuntu, install them with:
+```
+sudo apt-get install -y liblapack3 libblas3 libglu1-mesa
+```
+
 ### PDDL Planner (optional)
 
 To use `--use_pddl_planner`, two additional tools must be built from source.
