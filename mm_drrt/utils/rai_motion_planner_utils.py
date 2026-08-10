@@ -520,6 +520,54 @@ def get_fixed_arm_ik_ir_gen(robot, max_attempts=25, use_debug=False, **kwargs):
     return gen
 
 
+def get_fixed_arm_pick_place_ik_gen(robot, max_attempts=25, use_debug=False, custom_limits={},
+                                    start_collision_objs=[], goal_collision_objs=[], arm_joints=None):
+    """Fixed-arm pick+place analogue of get_fixed_arm_ik_ir_gen, but solves grasp_conf and
+    place_conf TOGETHER via ru.rai_pick_place_ik() (one 2-phase KOMO problem with an explicit
+    ry.SY.stable mode switch) instead of as two independent single-keyframe rai_ik() calls -- see
+    rai_pick_place_ik()'s docstring for why that matters: two independent solves can each land on
+    a different valid touching geometry for a top/side grasp's free rotation about the approach
+    axis, so an arm that reaches both confs exactly can still leave the carried object several cm
+    off its intended placement pose. A single joint solve can't be handed two different obstacle
+    sets directly (it only sees one C snapshot for its own soft collision term), so the two
+    confs are collision-checked separately afterward, each against its own obstacle list and with
+    that phase's own obstacle poses (re-)assigned first -- matching what the two independent
+    rai_ik() calls already did.
+
+    Yields (start_output, goal_output), each a (bq, approach_conf, conf) 3-tuple -- the same
+    shape get_fixed_arm_ik_ir_gen yields for a single call -- so subgoal_sampling can swap in
+    this function without changing how it unpacks the results."""
+    arm_joints, _, _, _ = ru._spec_of(robot, arm_joints)
+
+    def gen(arm, obj, start_pose, grasp, place_pose, start_obst_poses=(), goal_obst_poses=()):
+        bq = ru.Conf(robot, [], ())
+        for attempts in range(max_attempts):
+            if use_debug:
+                print('pick-place attempts', attempts)
+            for obst_pose in start_obst_poses:
+                obst_pose.assign()
+            start_pose.assign()
+            grasp_conf, place_conf = ru.rai_pick_place_ik(robot, grasp, place_pose.value,
+                                                           custom_limits=custom_limits, arm_joints=arm_joints)
+            if grasp_conf is None:
+                continue
+            ru.set_joint_positions(robot, arm_joints, grasp_conf)
+            if ru.check_collisions(robot, start_collision_objs, self_collisions=True, verbose=use_debug):
+                continue
+            for obst_pose in goal_obst_poses:
+                obst_pose.assign()
+            ru.set_joint_positions(robot, arm_joints, place_conf)
+            if ru.check_collisions(robot, goal_collision_objs, self_collisions=True, verbose=use_debug):
+                continue
+            if use_debug:
+                print('pick-place IK attempts:', attempts)
+            yield ((bq, grasp_conf, grasp_conf), (bq, place_conf, place_conf))
+            return
+        yield None
+
+    return gen
+
+
 def get_gripper(robot_id, arm='left', visual=True):
     _, gripper_frame, _, _ = ru._spec_of(robot_id)
     return gripper_frame

@@ -33,8 +33,9 @@ import itertools
 import robotic as ry
 
 from mm_drrt.utils import rai_utils as ru
-from mm_drrt.utils.rai_motion_planner_utils import get_fixed_arm_ik_ir_gen, get_placement_gen, \
-    get_grasp_gen, get_gripper, arm_retrieval_motion, get_arm_motion_fn, get_trivial_roadmap
+from mm_drrt.utils.rai_motion_planner_utils import get_placement_gen, \
+    get_grasp_gen, get_gripper, arm_retrieval_motion, get_arm_motion_fn, get_trivial_roadmap, \
+    get_fixed_arm_pick_place_ik_gen
 
 from examples.rai_utils import Environment, create_box
 
@@ -85,20 +86,36 @@ class ExampleTwoRobotsRaiEnvironment(Environment):
         for p in objs_poses:
             p.assign()
 
-        for i in range(len(remove_then_add_m_objs + add_m_objs) - 1):
-            for j in range(i + 1, len(remove_then_add_m_objs + add_m_objs)):
-                if ru.pairwise_collision(self._C, (remove_then_add_m_objs + add_m_objs)[i],
-                                        (remove_then_add_m_objs + add_m_objs)[j]):
+        # Every object newly PLACED at this fixed_obj by this sample, not just
+        # remove_then_add_m_objs + add_m_objs -- add_then_remove_m_objs (an object that arrives
+        # here and is later picked up again, e.g. a relay handoff point both boxes pass through)
+        # was previously left out of this mutual check entirely, so two such objects' sampled
+        # placements were never checked against each other and could land on (almost) the same
+        # spot. The stationary-object check just below this already correctly includes all three
+        # lists; this one didn't.
+        #
+        # Uses ru.boxes_overlap() (a plain AABB test), not ru.pairwise_collision()
+        # (C.computeCollisions()): confirmed by direct reproduction that RAI's collision engine
+        # never detects overlap between two frames that started far apart in the scene (e.g. two
+        # movable objects' own initial surfaces, meters apart) even once sample_placement() moves
+        # them right on top of each other -- exactly the situation every check in this method
+        # hits, so all of them use the AABB check instead. Every placement sampled here is
+        # axis-aligned (sample_placement() always uses an identity quaternion), so the AABB test
+        # is exact, not an approximation.
+        new_placements = remove_then_add_m_objs + add_then_remove_m_objs + add_m_objs
+        for i in range(len(new_placements) - 1):
+            for j in range(i + 1, len(new_placements)):
+                if ru.boxes_overlap(self._C, new_placements[i], new_placements[j]):
                     return False, []
 
         for add_m_obj in remove_then_add_m_objs + add_then_remove_m_objs + add_m_objs:
-            if any(ru.pairwise_collision(self._C, add_m_obj, obst) for obst in stationary_m_objs):
+            if any(ru.boxes_overlap(self._C, add_m_obj, obst) for obst in stationary_m_objs):
                 return False, []
 
         collisions = []
         for add_m_obj in remove_then_add_m_objs + add_m_objs:
             for remove_m_obj in remove_m_objs + add_then_remove_m_objs:
-                if ru.pairwise_collision(self._C, add_m_obj, remove_m_obj):
+                if ru.boxes_overlap(self._C, add_m_obj, remove_m_obj):
                     collisions.append((add_m_obj, remove_m_obj))
         return True, collisions
 
@@ -110,45 +127,49 @@ class ExampleTwoRobotsRaiEnvironment(Environment):
         for id, add_m_obj in enumerate(remove_then_add_m_objs + add_then_remove_m_objs + add_m_objs):
             if id == remove_then_add_m_obj_id:
                 continue
-            if ru.pairwise_collision(self._C, add_m_obj, remove_then_add_m_obj):
+            # ru.boxes_overlap(), not ru.pairwise_collision() -- see is_placement_collision()'s
+            # comment above: RAI's collision engine misses overlap between frames that started
+            # far apart in the scene, which is exactly this situation.
+            if ru.boxes_overlap(self._C, add_m_obj, remove_then_add_m_obj):
                 init_collisions.append((add_m_obj, remove_then_add_m_obj))
         cur_obj_pose.assign()
         return init_collisions
 
     def subgoal_sampling(self, robot, obj_orders, actions, action, m_obj, start_obstacles, goal_obstacles,
                          custom_limits={}, use_debug=False):
-        start_ik_ir_fn = get_fixed_arm_ik_ir_gen(robot, max_attempts=25,
-                                                 collision_objs=start_obstacles['objs'] + self.fixed_obstacles,
-                                                 custom_limits=custom_limits.get(robot, {}), use_debug=use_debug)
-        goal_ik_ir_fn = get_fixed_arm_ik_ir_gen(robot, max_attempts=25,
-                                                collision_objs=goal_obstacles['objs'] + self.fixed_obstacles,
-                                                custom_limits=custom_limits.get(robot, {}), use_debug=use_debug)
+        # Solves grasp_conf and place_conf together (one 2-phase KOMO problem with a mode switch)
+        # rather than as two independent rai_ik() calls, so the grasp offset used to reach
+        # grasp_conf is the SAME one that determines where the object ends up at place_conf --
+        # see get_fixed_arm_pick_place_ik_gen()/rai_pick_place_ik()'s docstrings for why that
+        # matters (independently-solved confs can land on different valid touching geometries and
+        # leave the carried object several cm off its intended placement pose even when the arm
+        # reaches both confs exactly).
+        pick_place_ik_fn = get_fixed_arm_pick_place_ik_gen(
+            robot, max_attempts=25,
+            start_collision_objs=start_obstacles['objs'] + self.fixed_obstacles,
+            goal_collision_objs=goal_obstacles['objs'] + self.fixed_obstacles,
+            custom_limits=custom_limits.get(robot, {}), use_debug=use_debug)
         self._assign_target_obj_pose(actions, obj_orders, m_obj, action)
         start_obj_pose = ru.Pose(self._C, m_obj)
         grasps = list(self.grasp_gen_fn(robot, m_obj))
 
         for grasp in grasps:
             (g,) = grasp
-            for obst_pose in start_obstacles['poses']:
-                obst_pose.assign()
-            pick_output = next(start_ik_ir_fn(self._arm, m_obj, start_obj_pose, g), None)
-            if pick_output:
-                if pick_output[-1]:
-                    for obst_pose in goal_obstacles['poses']:
-                        obst_pose.assign()
-                    place_output = next(goal_ik_ir_fn(self._arm, m_obj, action.goal['place'], g), None)
-                    if place_output:
-                        if place_output[-1]:
-                            action.start['grasp'] = g
-                            action.start['place'] = start_obj_pose
-                            action.start['base'] = pick_output[0]
-                            action.start['approach_conf'] = pick_output[1]
-                            action.start['grasp_conf'] = pick_output[2]
-                            action.goal['grasp'] = g
-                            action.goal['base'] = place_output[0]
-                            action.goal['approach_conf'] = place_output[1]
-                            action.goal['grasp_conf'] = place_output[2]
-                            return True
+            output = next(pick_place_ik_fn(self._arm, m_obj, start_obj_pose, g, action.goal['place'],
+                                           start_obst_poses=start_obstacles['poses'],
+                                           goal_obst_poses=goal_obstacles['poses']), None)
+            if output:
+                pick_output, place_output = output
+                action.start['grasp'] = g
+                action.start['place'] = start_obj_pose
+                action.start['base'] = pick_output[0]
+                action.start['approach_conf'] = pick_output[1]
+                action.start['grasp_conf'] = pick_output[2]
+                action.goal['grasp'] = g
+                action.goal['base'] = place_output[0]
+                action.goal['approach_conf'] = place_output[1]
+                action.goal['grasp_conf'] = place_output[2]
+                return True
         return False
 
     def compute_path(self, robot, action, m_obj, num_base_samples, num_arm_samples, type=None, use_debug=False):
