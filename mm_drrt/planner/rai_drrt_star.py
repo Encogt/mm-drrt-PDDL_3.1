@@ -8,10 +8,39 @@ from mm_drrt.utils.motion_planner_utils import OptimalNode, get_angle, \
     get_sub_q_near, connect_to_target, get_collision_free_paths_to_target, get_sub_q_list, \
     get_min_heuristic_vertex, get_random_neighbor_vertex, get_neighbor_vertices, compute_local_dist, \
     get_q_best, get_node_from_tree, rewire, get_heuristic_val, is_goal_in_tree, get_subprob, \
-    get_substarts_subgoals, update_subprob_id, is_q_new_in_subgoal, get_goals, get_sub_samples, get_subattachments,\
+    get_substarts_subgoals, update_subprob_id, is_q_new_in_subgoal, get_goals, get_sub_samples, \
     apply_order_constraints, is_violate_order_constraints, debug_2d_sub_sampling
 
 from mm_drrt.utils.rai_motion_planner_utils import get_inter_robots_collision_fn
+from mm_drrt.utils import rai_utils as ru
+
+
+def get_subattachments(array, subprob_id, nodes):
+    """RAI-specific replacement for motion_planner_utils.get_subattachments() -- NOT just an
+    alias, the lookup rule is different (see below). Kept local to this file (rather than
+    changing the shared original) since mm_drrt/planner/drrt_star.py (the pybullet pipeline)
+    imports that same shared function and this fix is only verified against the RAI envs.
+
+    Every roadmap segment already carries its own correct .attachments (baked in by whoever built
+    it, e.g. example_two_robots_rai_env.py's compute_path -- see its 'transit'/'transfer'
+    branches), so this always reports the segment currently being entered, full stop.
+
+    The original shared function instead reports the *previous* segment's attachment whenever
+    subprob_id just advanced (its own comment: "attachment must use the previous node
+    information"). That's correct when the advance crossed a trivial (zero-motion) placeholder --
+    the "local path reaching this node" is then entirely leftover motion from the old segment, so
+    the old segment's attachment is the only one that means anything. But the same branch also
+    fires on an ordinary advance between two *real* segments, where the local path is actually the
+    new segment's own motion -- e.g. a transfer's approach (holding the object) advancing into its
+    retrieval (already released, per compute_path's explicit .detach() before building that
+    roadmap): the old logic would report "holding" for a node whose real path is the empty-handed
+    retreat, so the object stays welded to the gripper through that entire retreat and into
+    whatever the robot does next. Confirmed via instrumentation on a Tamer-planned 2-object
+    crossing relay: box0 stayed rigidly offset from l_gripper (identical distance, tick after
+    tick) well past its intended release, only breaking free once the *next* action's own
+    real-segment attachment (correctly "not holding") finally took over."""
+    return [(array[r][subprob_id[r]].attachments[0] if array[r][subprob_id[r]].attachments else None)
+            for r in range(len(array))]
 
 
 def _advance_past_trivial(sub_q, sub_goals, subprob_id, goals, joint_dim, roadmaps):
@@ -288,7 +317,63 @@ class dRRTStar:
         if best_paths: print('dRRT* is solved successfully.')
         else:
             raise SystemExit('TIMEOUT: dRRT* is NOT solved.')
-        return get_node_from_tree(self.nodes, get_substarts_subgoals(self.goals, self.subprob_id, self.joint_dim), self.subprob_id).retrace()
+        final_path = get_node_from_tree(self.nodes, get_substarts_subgoals(self.goals, self.subprob_id, self.joint_dim), self.subprob_id).retrace()
+        self._tighten_composite_path(final_path)
+        return final_path
+
+    def _tighten_composite_path(self, composite_path):
+        """dRRT*'s composite tree-growth doesn't guarantee a node lands EXACTLY on a per-robot
+        roadmap segment's true final_conf (grasp_conf/place_conf) when that robot's subprob_id
+        advances -- only that it got close enough via whatever random growth step or
+        connect-to-target attempt happened to trigger the advance (is_q_new_in_subgoal / the
+        once-per-outer-loop connect_to_target in grow(), above). That gap is exactly what forced
+        rai_motion_planner_utils.replay_composite_path to do post-hoc position corrections
+        (box-support-distance snapping at grasp, surface-rest snapping at release) for every
+        grasp/placement -- confirmed via instrumentation on the 2-robot relay, where an object
+        was still 3-10cm from its true placement height right before that correction fired.
+
+        This tightens the solved path itself instead, in place: wherever a robot's subprob_id
+        crosses a real (non-trivial) segment boundary, append a short direct connecting motion
+        from wherever the growth step actually landed to that segment's true final_conf (the
+        exact conf get_arm_motion_fn/rai_ik solved for and validated), so the arm's own joint
+        path -- not just a replay-side pose correction -- ends up exactly at the grasp/place
+        configuration. Checked for inter-robot collision (the one thing not already validated by
+        the per-robot grasp/placement IK solve itself, which used enableCollisions=False/soft
+        self-collision only) against every other robot's frozen position at that same composite
+        node; skipped (falling back to replay's existing correction, which still runs as a
+        safety net) if that check fails -- a short direct connection failing collision-free is
+        expected to be rare, since both endpoints are each individually already valid and only a
+        few centimeters apart."""
+        prev_ids = list(composite_path[0].subprob_id)
+        for node in composite_path[1:]:
+            for r in range(self.num_robots):
+                new_id = node.subprob_id[r]
+                if new_id <= prev_ids[r]:
+                    continue
+                old_id = new_id - 1
+                prev_ids[r] = new_id
+                roadmap = self.roadmaps[r][old_id]
+                if roadmap.initial_conf == roadmap.final_conf:
+                    continue  # trivial placeholder segment (get_trivial_roadmap): nothing to tighten
+                path_r = node.sub_local_paths[r]
+                if not path_r:
+                    continue
+                q_last = np.asarray(path_r[-1])
+                q_target = np.asarray(roadmap.final_conf)
+                if np.max(np.abs(q_last - q_target)) < 1e-4:
+                    continue  # already exact
+                extend_fn = ru.get_extend_fn(self.robots[r], self.joints[r])
+                connecting = list(extend_fn(tuple(q_last), roadmap.final_conf))
+                collision_free = True
+                for q_step in connecting:
+                    q_check = list(node.sub_config)
+                    q_check[r] = q_step
+                    if self.inter_robots_collision_fn(q_check, mode='boolean'):
+                        collision_free = False
+                        break
+                if collision_free:
+                    node.sub_local_paths[r] = list(path_r) + connecting
+                    node.sub_config[r] = roadmap.final_conf
 
     def update_best_path(self, best_paths, best_path_cost):
         if is_goal_in_tree(self.nodes, get_goals(self.goals, self.joint_dim), self.roadmaps, self.subprob_id): # TODO: currently best path can be computed only when the final goals are reached.

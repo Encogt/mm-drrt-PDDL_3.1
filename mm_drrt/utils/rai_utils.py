@@ -479,6 +479,113 @@ def uniform_pose_generator(C, target_xy, min_radius=0.55, max_radius=0.7):
 
 ##### Frame helpers #####
 
+def _gripper_finger_names(gripper_frame):
+    """'l_gripper'/'r_gripper' -> ['l_panda_finger_joint1', 'l_panda_finger_joint2']."""
+    prefix = gripper_frame[:-len('gripper')] if gripper_frame.endswith('gripper') else gripper_frame
+    return [f'{prefix}panda_finger_joint{i}' for i in (1, 2)]
+
+
+_finger_open_local_offset_cache = {}
+
+
+def _finger_open_local_offset(C, gripper_frame, name):
+    """The finger's natural 'fully open' offset from the gripper frame, expressed in the
+    gripper's own local coordinates -- captured once, on first use (from the scenario file's own
+    untouched pose, since this must run before anything moves the arm), and cached that way
+    rather than as a raw world position so it stays valid as the arm/gripper moves later in the
+    replay (a raw world offset, captured once at the start, goes stale and points nowhere near
+    the gripper the moment the arm leaves its initial configuration)."""
+    key = (id(C), name)
+    offset = _finger_open_local_offset_cache.get(key)
+    if offset is None:
+        grip = C.getFrame(gripper_frame)
+        grip_pos = np.asarray(grip.getPosition())
+        R = _quat_to_rotation_matrix(grip.getQuaternion())
+        open_pos = np.asarray(C.getFrame(name).getPosition())
+        offset = R.T @ (open_pos - grip_pos)
+        _finger_open_local_offset_cache[key] = offset
+    return offset
+
+
+def set_gripper_fingers(C, gripper_frame, opening=None):
+    """Moves a gripper's finger frames directly to a world position interpolated between the
+    scenario file's own natural 'fully open' pose (captured once, on first use, before any
+    animation touches them) and the gripper's own reference point. `opening` is the desired
+    half-gap in meters (None, or >= the natural half-gap, means fully open; 0 means fully
+    closed, touching at the gripper's own point).
+
+    The Panda's finger joints are joint_active: False by default in panda.g/pandasTable.g and
+    mimic-linked to each other in the .g file; reactivating them as independent transY DOFs via
+    frame.setJoint() and driving them through C.setJointState() was tried first but doesn't
+    work here -- both fingers collapsed onto the identical world position for every input
+    (confirmed empirically: (0,0), (0.02,0.02) and (0.04,0.04) all produced zero gap between
+    them), because RAI keeps honoring the original mimic linkage regardless of the explicit
+    per-joint values passed in. This bypasses the joint/mimic system entirely and just
+    repositions the frames directly -- purely visual, same mechanism already relied on
+    elsewhere in this module for repositioning objects after C.attach()."""
+    C = _config_of(C)
+    grip = C.getFrame(gripper_frame)
+    grip_pos = np.asarray(grip.getPosition())
+    R = _quat_to_rotation_matrix(grip.getQuaternion())
+    for name in _gripper_finger_names(gripper_frame):
+        f = C.getFrame(name)
+        if f is None:
+            continue
+        local_offset = _finger_open_local_offset(C, gripper_frame, name)
+        natural = np.linalg.norm(local_offset)
+        if natural < 1e-9:
+            continue
+        target = natural if opening is None else min(max(opening, 0.0), natural)
+        f.setPosition(grip_pos + R @ (local_offset / natural * target))
+
+
+def gripper_finger_axis(C, gripper_frame):
+    """World-frame unit direction the gripper's fingers separate along, derived from finger1's
+    natural local offset (the same cached offset set_gripper_fingers uses) rotated by the
+    gripper's current orientation. Used to compute the correct finger-closing width for a held
+    object via box_support_distance -- the object's footprint across this specific direction,
+    not just its narrowest local dimension, since a top/side grasp permits free rotation around
+    the approach axis and the box's local X/Y sizes don't track that rotation."""
+    C = _config_of(C)
+    name = _gripper_finger_names(gripper_frame)[0]
+    local_offset = _finger_open_local_offset(C, gripper_frame, name)
+    norm = np.linalg.norm(local_offset)
+    if norm < 1e-9:
+        return np.array([0.0, 1.0, 0.0])
+    grip = C.getFrame(gripper_frame)
+    R = _quat_to_rotation_matrix(grip.getQuaternion())
+    return R @ (local_offset / norm)
+
+
+def _quat_to_rotation_matrix(quat):
+    w, x, y, z = quat
+    return np.array([
+        [1 - 2 * (y * y + z * z), 2 * (x * y - z * w), 2 * (x * z + y * w)],
+        [2 * (x * y + z * w), 1 - 2 * (x * x + z * z), 2 * (y * z - x * w)],
+        [2 * (x * z - y * w), 2 * (y * z + x * w), 1 - 2 * (x * x + y * y)],
+    ])
+
+
+def box_support_distance(direction_world, quat, size):
+    """Distance from a box's center to its own surface along a world-frame direction, for a box
+    with the given orientation and full extents `size`. Standard box-support formula: rotate the
+    direction into the box's own local frame, then the exit distance for an axis-aligned box of
+    half-extents h along a unit direction d is 1 / max_i(|d_i| / h_i). Verified empirically
+    against real KOMO negDistance=0 grasp solves (mm_drrt_ik-style top grasps): this matches the
+    solved gripper-to-object distance to within ~1mm, with no extra clearance term needed."""
+    direction_world = np.asarray(direction_world, dtype=float)
+    norm = np.linalg.norm(direction_world)
+    if norm < 1e-9:
+        return float(np.max(size) / 2.0)
+    direction_world = direction_world / norm
+    R = _quat_to_rotation_matrix(quat)
+    local_dir = R.T @ direction_world
+    half = np.asarray(size) / 2.0
+    ratios = np.abs(local_dir) / np.maximum(half, 1e-9)
+    denom = np.max(ratios)
+    return 1.0 / denom if denom > 1e-9 else float(np.max(half))
+
+
 def remove_frame(C, frame_name):
     _config_of(C).delFrame(frame_name)
 

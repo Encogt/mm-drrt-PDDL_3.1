@@ -1,12 +1,23 @@
 #!/usr/bin/env python
-"""RAI port of examples/envs/example_two_robots_env.py's 1-object relay scenario, but for two
+"""RAI port of examples/envs/example_two_robots_env.py's relay scenario(s), but for two
 FIXED Franka arms sharing one table (RAI's 'scenarios/pandasTable.g') instead of two mobile
-PR2s driving between three separate tables. See /home/enco/.claude/plans/deep-wobbling-sonnet.md.
+PR2s driving between three separate tables. See /home/enco/.claude/plans/deep-wobbling-sonnet.md
+(1-object relay) and /home/enco/.claude/plans/composed-yawning-lemon.md (2-object crossing
+relay).
 
 Layout (top view, y=0.15 line on the shared table): table_start (x=-0.8, l_panda-only reach) --
-table_mid (x=0.0, both arms reach) -- table_end (x=+0.8, r_panda-only reach). l_panda picks the
-box from table_start and places it at table_mid; r_panda picks it up from there and places it at
-table_end.
+table_mid (x=0.0, both arms reach) -- table_end (x=+0.8, r_panda-only reach).
+
+1-object mode (num_objs=1): l_panda picks the box from table_start and places it at table_mid;
+r_panda picks it up from there and places it at table_end.
+
+2-object mode (num_objs=2): box0 relays table_start -> table_mid -> table_end (l_panda hands off
+to r_panda) while box1 relays table_end -> table_mid -> table_start (r_panda hands off to
+l_panda) -- the fixed-arm analogue of example_two_robots_env.py's 2-object "swap" mode, which
+can't be a direct swap here since neither arm's reach spans the whole table. Each arm's own
+action order naturally serializes its two visits to table_mid (it can only do one action at a
+time), so no extra "don't overlap at the midpoint" constraint is needed beyond the normal
+per-box handoff constraint.
 
 No base motion exists for either arm (pandasTable.g mounts both rigidly) -- compute_path plans
 arm motion directly with expand_type=None (no base dimension to concatenate; see
@@ -45,8 +56,9 @@ SURFACE_X = {'start': -0.8, 'mid': 0.0, 'end': 0.8}
 class ExampleTwoRobotsRaiEnvironment(Environment):
     def __init__(self, num_robots, num_objs, arm, grasp_type, sim_id, seed):
         super().__init__(num_objs, seed)
-        if num_robots != 2 or num_objs != 1:
-            raise Exception("This scenario supports exactly 2 robots and 1 object (relay).")
+        if num_robots != 2 or num_objs not in (1, 2):
+            raise Exception("This scenario supports exactly 2 robots and 1 or 2 objects "
+                            "(1-object relay or 2-object crossing relay).")
         self._num_robots = num_robots
         self._num_m_objs = num_objs
         self._C = sim_id
@@ -264,48 +276,101 @@ class ExampleTwoRobotsRaiEnvironment(Environment):
                             actions[obj_orders[id - 1]].goal['place'].assign()
 
     def create_plan_order_constraints(self):
-        # Relay: robot0 (left arm) picks from table_start -> table_mid, robot1 (right arm) picks
-        # from table_mid -> table_end. Mirrors example_two_robots_env.py's 1-object relay mode.
-        plan = {
-            'a0': ('transit',  self.robots[0], self.m_objs[0], None,           self.f_objs[0]),
-            'a1': ('transfer', self.robots[0], self.m_objs[0], self.f_objs[0], self.f_objs[1]),
-            'a2': ('transit',  self.robots[1], self.m_objs[0], None,           self.f_objs[1]),
-            'a3': ('transfer', self.robots[1], self.m_objs[0], self.f_objs[1], self.f_objs[2]),
-        }
-        action_orders = {self.robots[0]: ('a0', 'a1'),
-                         self.robots[1]: ('a2', 'a3')}
-        obj_orders = {self.m_objs[0]: ['a1', 'a3']}
-        init_order_constraints = ({'pre': 'a1', 'post': 'a2'},)
+        if self._num_m_objs == 1:
+            # Relay: robot0 (left arm) picks from table_start -> table_mid, robot1 (right arm)
+            # picks from table_mid -> table_end. Mirrors example_two_robots_env.py's 1-object
+            # relay mode.
+            plan = {
+                'a0': ('transit',  self.robots[0], self.m_objs[0], None,           self.f_objs[0]),
+                'a1': ('transfer', self.robots[0], self.m_objs[0], self.f_objs[0], self.f_objs[1]),
+                'a2': ('transit',  self.robots[1], self.m_objs[0], None,           self.f_objs[1]),
+                'a3': ('transfer', self.robots[1], self.m_objs[0], self.f_objs[1], self.f_objs[2]),
+            }
+            action_orders = {self.robots[0]: ('a0', 'a1'),
+                             self.robots[1]: ('a2', 'a3')}
+            obj_orders = {self.m_objs[0]: ['a1', 'a3']}
+            init_order_constraints = ({'pre': 'a1', 'post': 'a2'},)
+        else:
+            # Crossing relay: box0 goes table_start -> table_mid -> table_end (robot0 hands off
+            # to robot1), box1 goes table_end -> table_mid -> table_start (robot1 hands off to
+            # robot0). Each robot's own action order already serializes its two visits to
+            # table_mid, so the only cross-robot constraints needed are the two handoffs.
+            plan = {
+                'a0': ('transit',  self.robots[0], self.m_objs[0], None,           self.f_objs[0]),
+                'a1': ('transfer', self.robots[0], self.m_objs[0], self.f_objs[0], self.f_objs[1]),
+                'a2': ('transit',  self.robots[1], self.m_objs[0], None,           self.f_objs[1]),
+                'a3': ('transfer', self.robots[1], self.m_objs[0], self.f_objs[1], self.f_objs[2]),
+                'a4': ('transit',  self.robots[1], self.m_objs[1], None,           self.f_objs[2]),
+                'a5': ('transfer', self.robots[1], self.m_objs[1], self.f_objs[2], self.f_objs[1]),
+                'a6': ('transit',  self.robots[0], self.m_objs[1], None,           self.f_objs[1]),
+                'a7': ('transfer', self.robots[0], self.m_objs[1], self.f_objs[1], self.f_objs[0]),
+            }
+            action_orders = {self.robots[0]: ('a0', 'a1', 'a6', 'a7'),
+                             self.robots[1]: ('a2', 'a3', 'a4', 'a5')}
+            obj_orders = {self.m_objs[0]: ['a1', 'a3'],
+                          self.m_objs[1]: ['a5', 'a7']}
+            init_order_constraints = ({'pre': 'a1', 'post': 'a2'},   # box0 handoff at table_mid
+                                      {'pre': 'a5', 'post': 'a6'})   # box1 handoff at table_mid
         return plan, action_orders, obj_orders, init_order_constraints
 
     def create_pddl_problem(self):
-        """PDDL 2.1 problem for the 1-object / 2-robot relay scenario (same shape as
+        """PDDL 2.1 problem for the 2-robot relay scenario(s) (same shape as
         example_two_robots_env.py's, robot-can-reach constrained to each arm's own zone)."""
-        objects = {
-            'robot':       [self.robots[0], self.robots[1]],
-            'movable-obj': [self.m_objs[0]],
-            'fixed-obj':   [self.f_objs[0], self.f_objs[1], self.f_objs[2]],
-        }
-        init_state = [
-            ('robot-free',         self.robots[0]),
-            ('robot-free',         self.robots[1]),
-            ('robot-at-base',      self.robots[0]),
-            ('robot-at-base',      self.robots[1]),
-            ('obj-location',       self.m_objs[0], self.f_objs[0]),
-            ('obj-clear',          self.m_objs[0]),
-            ('surface-accessible', self.f_objs[0]),
-            ('surface-accessible', self.f_objs[1]),
-            ('surface-accessible', self.f_objs[2]),
-            ('robot-can-reach',    self.robots[0], self.f_objs[0]),
-            ('robot-can-reach',    self.robots[0], self.f_objs[1]),
-            ('robot-can-reach',    self.robots[1], self.f_objs[1]),
-            ('robot-can-reach',    self.robots[1], self.f_objs[2]),
-        ]
-        goal_state = [
-            ('obj-location', self.m_objs[0], self.f_objs[2]),
-            ('robot-free',   self.robots[0]),
-            ('robot-free',   self.robots[1]),
-        ]
+        if self._num_m_objs == 1:
+            objects = {
+                'robot':       [self.robots[0], self.robots[1]],
+                'movable-obj': [self.m_objs[0]],
+                'fixed-obj':   [self.f_objs[0], self.f_objs[1], self.f_objs[2]],
+            }
+            init_state = [
+                ('robot-free',         self.robots[0]),
+                ('robot-free',         self.robots[1]),
+                ('robot-at-base',      self.robots[0]),
+                ('robot-at-base',      self.robots[1]),
+                ('obj-location',       self.m_objs[0], self.f_objs[0]),
+                ('obj-clear',          self.m_objs[0]),
+                ('surface-accessible', self.f_objs[0]),
+                ('surface-accessible', self.f_objs[1]),
+                ('surface-accessible', self.f_objs[2]),
+                ('robot-can-reach',    self.robots[0], self.f_objs[0]),
+                ('robot-can-reach',    self.robots[0], self.f_objs[1]),
+                ('robot-can-reach',    self.robots[1], self.f_objs[1]),
+                ('robot-can-reach',    self.robots[1], self.f_objs[2]),
+            ]
+            goal_state = [
+                ('obj-location', self.m_objs[0], self.f_objs[2]),
+                ('robot-free',   self.robots[0]),
+                ('robot-free',   self.robots[1]),
+            ]
+        else:
+            objects = {
+                'robot':       [self.robots[0], self.robots[1]],
+                'movable-obj': [self.m_objs[0], self.m_objs[1]],
+                'fixed-obj':   [self.f_objs[0], self.f_objs[1], self.f_objs[2]],
+            }
+            init_state = [
+                ('robot-free',         self.robots[0]),
+                ('robot-free',         self.robots[1]),
+                ('robot-at-base',      self.robots[0]),
+                ('robot-at-base',      self.robots[1]),
+                ('obj-location',       self.m_objs[0], self.f_objs[0]),
+                ('obj-location',       self.m_objs[1], self.f_objs[2]),
+                ('obj-clear',          self.m_objs[0]),
+                ('obj-clear',          self.m_objs[1]),
+                ('surface-accessible', self.f_objs[0]),
+                ('surface-accessible', self.f_objs[1]),
+                ('surface-accessible', self.f_objs[2]),
+                ('robot-can-reach',    self.robots[0], self.f_objs[0]),
+                ('robot-can-reach',    self.robots[0], self.f_objs[1]),
+                ('robot-can-reach',    self.robots[1], self.f_objs[1]),
+                ('robot-can-reach',    self.robots[1], self.f_objs[2]),
+            ]
+            goal_state = [
+                ('obj-location', self.m_objs[0], self.f_objs[2]),
+                ('obj-location', self.m_objs[1], self.f_objs[0]),
+                ('robot-free',   self.robots[0]),
+                ('robot-free',   self.robots[1]),
+            ]
         return objects, init_state, goal_state
 
     def _create_problem(self):
@@ -324,17 +389,32 @@ class ExampleTwoRobotsRaiEnvironment(Environment):
                 .setColor([0.5, 0.5, 0.9]).setContact(0)
             f_objs.append(name)
 
-        box_z = SURFACE_Z + SURFACE_SIZE[2] / 2.0 + BOX[2] / 2.0
-        box_pos = (SURFACE_X['start'], SURFACE_Y, box_z)
-        box_name = create_box(self._C, 'box0', box_pos, BOX)
-        box_pose = (box_pos, (1.0, 0.0, 0.0, 0.0))
-
         self.robots = {0: ru.RaiRobot(self._C, ru.LEFT_ARM), 1: ru.RaiRobot(self._C, ru.RIGHT_ARM)}
         for robot in self.robots.values():
             self.custom_limits[robot] = {}
             self._grippers[robot] = get_gripper(robot)
 
-        self.m_objs = [box_name]
         self.f_objs = f_objs
-        self.m_objs_init_placements = {box_name: ru.Pose(self._C, box_name, box_pose, f_objs[0])}
-        self.m_obj_in_f_obj = {f_objs[0]: {box_name}}
+        box_z = SURFACE_Z + SURFACE_SIZE[2] / 2.0 + BOX[2] / 2.0
+        if self._num_m_objs == 1:
+            box_pos = (SURFACE_X['start'], SURFACE_Y, box_z)
+            box_name = create_box(self._C, 'box0', box_pos, BOX)
+            box_pose = (box_pos, (1.0, 0.0, 0.0, 0.0))
+
+            self.m_objs = [box_name]
+            self.m_objs_init_placements = {box_name: ru.Pose(self._C, box_name, box_pose, f_objs[0])}
+            self.m_obj_in_f_obj = {f_objs[0]: {box_name}}
+        else:
+            box0_pos = (SURFACE_X['start'], SURFACE_Y, box_z)
+            box0_name = create_box(self._C, 'box0', box0_pos, BOX, color=(1.0, 0.0, 0.0))
+            box0_pose = (box0_pos, (1.0, 0.0, 0.0, 0.0))
+            box1_pos = (SURFACE_X['end'], SURFACE_Y, box_z)
+            box1_name = create_box(self._C, 'box1', box1_pos, BOX, color=(0.0, 0.0, 1.0))
+            box1_pose = (box1_pos, (1.0, 0.0, 0.0, 0.0))
+
+            self.m_objs = [box0_name, box1_name]
+            self.m_objs_init_placements = {
+                box0_name: ru.Pose(self._C, box0_name, box0_pose, f_objs[0]),
+                box1_name: ru.Pose(self._C, box1_name, box1_pose, f_objs[2]),
+            }
+            self.m_obj_in_f_obj = {f_objs[0]: {box0_name}, f_objs[2]: {box1_name}}
