@@ -21,6 +21,26 @@ GRASP_LENGTH = 0.03
 APPROACH_DISTANCE = 0.1 + GRASP_LENGTH
 
 
+def _animate_to_pose(C, frame_name, target_pos, target_quat, pause_time, steps=8):
+    """Smoothly interpolates a frame's world pose from its current value to a target pose over
+    a few rendered frames, instead of an instantaneous position/orientation overwrite -- avoids
+    the visible 'snap'/teleport a single-frame correction produces, at either grasp or
+    placement."""
+    f = C.getFrame(frame_name)
+    start_pos = np.asarray(f.getPosition())
+    start_quat = np.asarray(f.getQuaternion())
+    target_pos = np.asarray(target_pos)
+    target_quat = np.asarray(target_quat)
+    for i in range(1, steps + 1):
+        t = i / steps
+        f.setPosition(start_pos + (target_pos - start_pos) * t)
+        q = start_quat + (target_quat - start_quat) * t
+        norm = np.linalg.norm(q)
+        f.setQuaternion(q / norm if norm > 1e-9 else target_quat)
+        C.view(False)
+        time.sleep(pause_time)
+
+
 def get_trivial_roadmap(conf, attachments=[]):
     """A degenerate, no-op roadmap: start == goal == conf, nothing to actually plan. The
     multi-robot dRRT* machinery (task_planner_utils.py's assign_order_constraints, subprob_id
@@ -63,10 +83,26 @@ def replay_composite_path(C, composite_path, joints, release_targets, gripper_fr
     -- the pybullet version needs a separate experiments/visualizer.py run against the pickled
     output -- so this replays it directly in the same window used for planning.
 
+    Purely kinematic (C.setJointState() + C.attach()), matching the pattern the rai library's own
+    author uses for pick-and-place (rai-tutorials/demos/endless-box-pnp.py: play a motion, then
+    C.attach()) rather than driving a real physics engine. A real-physics version of this function
+    was tried and reverted: physx's own position controller has real tracking lag at any pace this
+    planner's waypoints imply, which reads as jank, and chasing that lag (larger tau, substepping,
+    proximity-gated retries) never converged to something both smooth and reliable -- confirmed
+    even the rai author's own physics-grasp demo (demos/botop-grasp.py) frames real-physics grasping
+    as a narrow, fragile test of PhysX's PD/friction response, not a general execution pattern, and
+    drives motion through BotOp's own spline-over-duration interface rather than a raw per-waypoint
+    position target as this function was doing.
+
     joints: per-robot list of joint names (env.get_joints(robots)).
-    release_targets: per-robot frame name to reattach a carried object to once it's released (the
-    composite_path only records the grasped object's name, not its destination surface, so the
-    caller supplies it -- for this single-object POC it's simply the destination table).
+    release_targets: dict mapping (robot index, movable-object frame name) to the frame it
+    should be reattached to once released (the composite_path only records which object is
+    currently grasped, not its destination -- the caller supplies the full mapping). Keyed by
+    (robot index, object), not just object: an object can go through more than one transfer
+    action over a plan (e.g. a relay handoff, one robot places it at a mid-point and a second
+    robot later places it at the final destination) -- a plain per-object mapping can only hold
+    one destination per object, so a later transfer for the same object would silently overwrite
+    an earlier robot's own destination.
     gripper_frames: per-robot gripper frame name to attach a carried object to. Defaults to
     ru.GRIPPER_FRAME for every robot (the single-mobile-robot scenario).
     """
@@ -74,24 +110,98 @@ def replay_composite_path(C, composite_path, joints, release_targets, gripper_fr
     if gripper_frames is None:
         gripper_frames = [ru.GRIPPER_FRAME] * num_robots
     currently_attached = [None] * num_robots
+    for gf in gripper_frames:
+        ru.set_gripper_fingers(C, gf)
     for node in composite_path:
-        for j in range(get_max_length_list(node.sub_local_paths)):
+        n_j = get_max_length_list(node.sub_local_paths)
+        for j in range(n_j):
             for r in range(num_robots):
                 path_r = node.sub_local_paths[r]
                 if not path_r:
                     continue
                 q = path_r[-1] if len(path_r) <= j else path_r[j]
                 ru.set_joint_positions(C, joints[r], q)
-            for r in range(num_robots):
-                held = node.attachments[r] if node.attachments else None
-                if held and not currently_attached[r]:
-                    C.attach(gripper_frames[r], held)
-                    currently_attached[r] = held
-                elif not held and currently_attached[r]:
-                    C.attach(release_targets[r], currently_attached[r])
-                    currently_attached[r] = None
             C.view(False)
             time.sleep(pause_time)
+        # Attach/detach checked once per node, at its LAST waypoint -- not at every waypoint
+        # starting from the first. A composite_path node is one dRRT* growth step, and its FIRST
+        # waypoint isn't guaranteed to sit exactly at the previous segment's boundary conf (that's
+        # only an invariant of the abstract subprob_id bookkeeping, not of where this particular
+        # node's interpolated path actually starts); node.attachments[r] describes the segment
+        # this node's growth step actually LANDS in, i.e. its last waypoint, not its first.
+        # Checking from j=0 can attach/release using whatever offset happens to exist mid-transit
+        # instead of the true grasp/placement pose -- confirmed via instrumentation on a
+        # physics-backed version of this function, where releasing at j=0 dropped an object ~0.4m
+        # short of its real placement target and the next robot's pickup, correctly planned
+        # against the (unreached) intended drop point, could never find it either.
+        for r in range(num_robots):
+            held = node.attachments[r] if node.attachments else None
+            if held and not currently_attached[r]:
+                # C.attach() only reparents -- it preserves whatever world pose the object
+                # happened to have at this exact replay waypoint (same node-boundary granularity
+                # issue as the release case below), which can leave the object floating short of
+                # the true grasp pose, or overlapping it, if that waypoint didn't land exactly on
+                # grasp_conf. A real touching grasp does NOT sit at zero offset from the gripper
+                # frame -- l_gripper is a small contact marker, not the object's center point --
+                # and the object's own orientation at the free rotation the grasp permits varies
+                # the touching offset's direction, so there's no single fixed target pose to snap
+                # to. Instead, keep the object's current (already roughly-converged) direction
+                # from the gripper, but recompute the *distance* along that direction so the
+                # object's surface exactly touches the gripper -- using the same box-support-
+                # distance formula verified against real KOMO negDistance=0 grasp solves
+                # (rai_utils.box_support_distance): this is always geometrically correct
+                # regardless of orientation, so it neither clips into the gripper nor floats.
+                # Applied via a short smooth interpolation (_animate_to_pose), not an instant
+                # position overwrite, since even a small single-frame jump reads as an
+                # unnatural "snap".
+                gripper = C.getFrame(gripper_frames[r])
+                grip_pos = np.asarray(gripper.getPosition())
+                C.attach(gripper_frames[r], held)
+                obj_frame = C.getFrame(held)
+                obj_size = np.asarray(obj_frame.getSize()[:3])
+                obj_quat = obj_frame.getQuaternion()
+                obj_pos = np.asarray(obj_frame.getPosition())
+                offset = obj_pos - grip_pos
+                dist = np.linalg.norm(offset)
+                direction = offset / dist if dist > 1e-6 else np.array([0.0, 0.0, -1.0])
+                target_dist = ru.box_support_distance(direction, obj_quat, obj_size)
+                _animate_to_pose(C, held, grip_pos + direction * target_dist, obj_quat, pause_time)
+                currently_attached[r] = held
+                # Finger opening width also uses box_support_distance, along the direction the
+                # fingers actually separate on (rai_utils.gripper_finger_axis) rather than the
+                # object's own local X/Y size -- a top grasp permits free rotation around the
+                # approach axis, so the box's footprint across the fingers' real closing
+                # direction varies with that rotation and isn't just its narrowest local
+                # dimension (confirmed: the previous min(obj_size[0], obj_size[1]) heuristic
+                # clipped whenever a solve landed on an orientation wider than that assumption).
+                finger_axis = ru.gripper_finger_axis(C, gripper_frames[r])
+                half_width = ru.box_support_distance(finger_axis, obj_quat, obj_size)
+                ru.set_gripper_fingers(C, gripper_frames[r], half_width + 0.003)
+            elif not held and currently_attached[r]:
+                obj_name = currently_attached[r]
+                dest_frame_name = release_targets[(r, obj_name)]
+                C.attach(dest_frame_name, obj_name)
+                # C.attach() only reparents -- it preserves whatever world pose the object
+                # happened to have at this exact replay waypoint, which (same node-boundary
+                # granularity issue as above) can be short of where the plan actually intended it
+                # to land, leaving it floating above the surface instead of resting on it. Snap it
+                # down explicitly, using the same formula every placement was originally sampled
+                # with (sample_placement(), rai_utils.py): resting exactly on the destination
+                # surface, upright. Keeps the object's current X/Y (already close, since the arm's
+                # planned path targets the right horizontal position) and only corrects height +
+                # orientation, which is what "floating above the ground" actually is. Applied via
+                # a short smooth interpolation (_animate_to_pose) so the object visibly settles
+                # onto the surface instead of teleporting there.
+                dest = C.getFrame(dest_frame_name)
+                dest_pos = np.asarray(dest.getPosition())
+                dest_size = np.asarray(dest.getSize()[:3])
+                obj_frame = C.getFrame(obj_name)
+                obj_size = np.asarray(obj_frame.getSize()[:3])
+                cur_pos = np.asarray(obj_frame.getPosition())
+                rest_z = dest_pos[2] + dest_size[2] / 2.0 + obj_size[2] / 2.0
+                _animate_to_pose(C, obj_name, [cur_pos[0], cur_pos[1], rest_z], [1.0, 0.0, 0.0, 0.0], pause_time)
+                ru.set_gripper_fingers(C, gripper_frames[r])
+                currently_attached[r] = None
 
 
 def plan_joint_motion(robot, joints, end_conf, obstacles=[], attachments=[],
@@ -404,6 +514,54 @@ def get_fixed_arm_ik_ir_gen(robot, max_attempts=25, use_debug=False, **kwargs):
             if use_debug:
                 print('IK attempts:', attempts)
             yield (bq,) + ik_outputs
+            return
+        yield None
+
+    return gen
+
+
+def get_fixed_arm_pick_place_ik_gen(robot, max_attempts=25, use_debug=False, custom_limits={},
+                                    start_collision_objs=[], goal_collision_objs=[], arm_joints=None):
+    """Fixed-arm pick+place analogue of get_fixed_arm_ik_ir_gen, but solves grasp_conf and
+    place_conf TOGETHER via ru.rai_pick_place_ik() (one 2-phase KOMO problem with an explicit
+    ry.SY.stable mode switch) instead of as two independent single-keyframe rai_ik() calls -- see
+    rai_pick_place_ik()'s docstring for why that matters: two independent solves can each land on
+    a different valid touching geometry for a top/side grasp's free rotation about the approach
+    axis, so an arm that reaches both confs exactly can still leave the carried object several cm
+    off its intended placement pose. A single joint solve can't be handed two different obstacle
+    sets directly (it only sees one C snapshot for its own soft collision term), so the two
+    confs are collision-checked separately afterward, each against its own obstacle list and with
+    that phase's own obstacle poses (re-)assigned first -- matching what the two independent
+    rai_ik() calls already did.
+
+    Yields (start_output, goal_output), each a (bq, approach_conf, conf) 3-tuple -- the same
+    shape get_fixed_arm_ik_ir_gen yields for a single call -- so subgoal_sampling can swap in
+    this function without changing how it unpacks the results."""
+    arm_joints, _, _, _ = ru._spec_of(robot, arm_joints)
+
+    def gen(arm, obj, start_pose, grasp, place_pose, start_obst_poses=(), goal_obst_poses=()):
+        bq = ru.Conf(robot, [], ())
+        for attempts in range(max_attempts):
+            if use_debug:
+                print('pick-place attempts', attempts)
+            for obst_pose in start_obst_poses:
+                obst_pose.assign()
+            start_pose.assign()
+            grasp_conf, place_conf = ru.rai_pick_place_ik(robot, grasp, place_pose.value,
+                                                           custom_limits=custom_limits, arm_joints=arm_joints)
+            if grasp_conf is None:
+                continue
+            ru.set_joint_positions(robot, arm_joints, grasp_conf)
+            if ru.check_collisions(robot, start_collision_objs, self_collisions=True, verbose=use_debug):
+                continue
+            for obst_pose in goal_obst_poses:
+                obst_pose.assign()
+            ru.set_joint_positions(robot, arm_joints, place_conf)
+            if ru.check_collisions(robot, goal_collision_objs, self_collisions=True, verbose=use_debug):
+                continue
+            if use_debug:
+                print('pick-place IK attempts:', attempts)
+            yield ((bq, grasp_conf, grasp_conf), (bq, place_conf, place_conf))
             return
         yield None
 

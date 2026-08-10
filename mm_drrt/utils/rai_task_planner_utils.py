@@ -542,6 +542,13 @@ def find_ignore_objs(actions, action, collisions, init_collisions, ignore_from_m
     elif type == 'remove':
         const_actions = actions[action[0]].order_constraints['post']
     for const_action in const_actions:
+        # order_constraints['pre']/['post'] mixes plain action-name strings (from the env's
+        # manually-specified init_order_constraints) with Action objects (auto-appended by
+        # add_order_constraints() below when two objects' sampled placements collide) -- only the
+        # latter can be resolved to a m_obj here, so skip the former (same guard as
+        # assign_order_constraints()'s isinstance(p, str) check).
+        if isinstance(const_action, str):
+            continue
         for collision in collisions:  # collisions with remove_m_objs, add_then_remove_m_objs
             if type == 'add':
                 obj = collision[1]

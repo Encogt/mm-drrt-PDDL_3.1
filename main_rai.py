@@ -101,17 +101,19 @@ data_saver(composite_path, opt)
 if opt.use_gui:
     robots = list(env.robots.values())
     joints = env.get_joints(robots)
-    # Whatever a robot released was headed for that robot's own last transfer target -- derive it
-    # from the plan instead of assuming a single shared destination (true for the single-robot
-    # scenario, false for a relay where each robot has its own hand-off/goal surface).
-    release_targets = []
-    for r in robots:
-        to_f = None
-        for name in action_orders[r]:
-            a_type, a_robot, a_m_obj, a_from, a_to = plan[name]
-            if a_type == 'transfer':
-                to_f = a_to
-        release_targets.append(to_f)
+    # Keyed by (robot index, object name), not just object name -- an object can go through more
+    # than one transfer action over the course of a plan (e.g. a relay handoff: one robot places
+    # it at a mid-point, a second robot later places it at the final destination), and a plain
+    # per-object dict can only hold one destination per object, so a later transfer action for
+    # the same object silently overwrites an earlier robot's own destination. Confirmed via
+    # instrumentation on the 2-robot relay: box0 has two transfer actions (a1: l_ arm -> mid, a3:
+    # r_ arm -> end); a flat per-object dict left both robots using a3's 'end' target, so the
+    # first robot's release snapped/reparented the object 0.87m away from where it actually
+    # placed it.
+    release_targets = {}
+    for name, (a_type, a_robot, a_m_obj, a_from, a_to) in plan.items():
+        if a_type == 'transfer':
+            release_targets[(robots.index(a_robot), a_m_obj)] = a_to
     gripper_frames = [getattr(getattr(r, 'spec', None), 'gripper_frame', None) for r in robots]
     if all(g is None for g in gripper_frames):
         gripper_frames = None  # single-mobile-robot scenario: replay_composite_path's own default

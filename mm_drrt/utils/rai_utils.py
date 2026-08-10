@@ -374,6 +374,25 @@ def pairwise_collision(C, name_a, name_b, tolerance=COLLISION_TOLERANCE):
     return False
 
 
+def boxes_overlap(C, name_a, name_b, margin=0.0):
+    """Axis-aligned bounding-box overlap check between two box-shaped frames, using their
+    getPosition()/getSize() directly rather than C.computeCollisions(). Needed specifically for
+    placement-sampling collision checks: RAI's collision engine appears to cache broadphase
+    proximity from a config's initial frame layout and never re-detect a pair that started far
+    apart (e.g. two movable objects' own starting surfaces, meters apart) even after both are
+    later moved close together by sample_placement() -- confirmed by direct reproduction: two
+    boxes moved to 3cm apart (well within their ~7x5cm footprint, a clear overlap) reported zero
+    entries from computeCollisions()/getCollisions(), while the identical check against frames
+    that started out close together works correctly. Every movable-object placement this project
+    samples is axis-aligned (sample_placement() always uses an identity quaternion), so a plain
+    AABB test is exact here, not an approximation."""
+    C = _config_of(C)
+    fa, fb = C.getFrame(name_a), C.getFrame(name_b)
+    pa, pb = np.asarray(fa.getPosition()), np.asarray(fb.getPosition())
+    sa, sb = np.asarray(fa.getSize()[:3]), np.asarray(fb.getSize()[:3])
+    return bool(np.all(np.abs(pa - pb) < (sa + sb) / 2.0 + margin))
+
+
 def robot_obstacle_collision(C, obstacle_names, tolerance=COLLISION_TOLERANCE):
     """True if any robot frame currently penetrates any of the named obstacle frames."""
     C = _config_of(C)
@@ -401,6 +420,31 @@ def plan_direct_joint_motion(C, joint_names, end_conf, obstacles=[], attachments
 
 
 ##### Grasp-pose IK via KOMO #####
+
+# Pairs of scalarProduct constraints, [gripper_frame, obj_frame_name] order, that together pin
+# the gripper's local X axis (its squeeze axis) to be PARALLEL to one specific local axis of the
+# object -- rather than just perpendicular to one axis (leaving a free rotation around the
+# approach direction). Matches robotic/manipulation.py's own grasp_box(): its 'x'/'y'/'z'
+# grasp_direction choices use exactly these three pairs to align the squeeze axis with the
+# object's X/Y/Z axis respectively. 'top' aligns with the object's own X axis (a horizontal
+# squeeze, matching an approach-from-above); 'side' aligns with the object's Z axis (a vertical
+# squeeze, matching an approach-from-the-side).
+_GRASP_ALIGN = {
+    'top': (ry.FS.scalarProductXY, ry.FS.scalarProductXZ),
+    'side': (ry.FS.scalarProductXX, ry.FS.scalarProductXY),
+}
+
+# Row selector (for a positionRel equality objective) picking out the one object axis each
+# grasp_type's squeeze aligns with (matches _GRASP_ALIGN above) -- negDistance alone only
+# requires the gripper to touch the object SOMEWHERE, not centered along that axis, so without
+# this a solve can converge anywhere from dead-center to right at the object's edge (confirmed
+# empirically: world-frame offset along the squeeze axis ranged +-0.035, i.e. the object's full
+# half-width, across repeated solves of the same grasp). This pins it to exactly 0.
+_GRASP_CENTER_AXIS = {
+    'top': np.array([[1, 0, 0]]),
+    'side': np.array([[0, 0, 1]]),
+}
+
 
 def rai_ik(robot, base_conf, grasp, custom_limits={}, view=False, max_attempts=6,
           arm_joints=None, gripper_frame=None, base_joints=None):
@@ -433,12 +477,23 @@ def rai_ik(robot, base_conf, grasp, custom_limits={}, view=False, max_attempts=6
             komo.addObjective([1], ry.FS.accumulatedCollisions, [], ry.OT.sos, [3e1])
             komo.addObjective([1], ry.FS.negDistance, [gripper_frame, grasp.obj_frame_name],
                               ry.OT.eq, [1e1])
-            if grasp.grasp_type == 'top':
-                komo.addObjective([1], ry.FS.scalarProductXZ, [gripper_frame, grasp.obj_frame_name],
+            # Two scalarProduct constraints, not one -- a single one only pins the gripper's
+            # squeeze axis to be PERPENDICULAR to one object axis, leaving a full free rotation
+            # around the approach direction (confirmed empirically: five KOMO solves against the
+            # same box, same grasp_type, landed on five different yaw angles). Matches
+            # robotic/manipulation.py's own grasp_box() (grasp_direction='x': align=[scalarProductXY,
+            # scalarProductXZ]): together, perpendicular-to-Y AND perpendicular-to-Z pins the
+            # gripper's local X (its squeeze axis) to be PARALLEL to the object's own local X axis
+            # (up to a 180-degree flip) -- i.e. always grasping parallel to an edge of the box,
+            # never at a diagonal.
+            for align_fs in _GRASP_ALIGN.get(grasp.grasp_type, _GRASP_ALIGN['side']):
+                komo.addObjective([1], align_fs, [gripper_frame, grasp.obj_frame_name],
                                   ry.OT.eq, [1e1], [0.0])
-            else:
-                komo.addObjective([1], ry.FS.scalarProductXY, [gripper_frame, grasp.obj_frame_name],
-                                  ry.OT.eq, [1e1], [0.0])
+            # Centers the gripper along the squeeze axis (see _GRASP_CENTER_AXIS above) --
+            # negDistance only requires touching the object somewhere, not centered.
+            center_row = _GRASP_CENTER_AXIS.get(grasp.grasp_type, _GRASP_CENTER_AXIS['side'])
+            komo.addObjective([1], ry.FS.positionRel, [gripper_frame, grasp.obj_frame_name],
+                              ry.OT.eq, center_row * 1e1)
             if attempt > 0:
                 x_init = np.random.uniform(lower, upper)
                 komo.initWithConstant(x_init)
@@ -451,6 +506,79 @@ def rai_ik(robot, base_conf, grasp, custom_limits={}, view=False, max_attempts=6
                 if all_between(lower, q, upper):
                     return q
         return None
+    finally:
+        C.selectJoints(original_joints)
+
+
+def rai_pick_place_ik(robot, grasp, place_pose, custom_limits={}, view=False, max_attempts=6,
+                      arm_joints=None, gripper_frame=None, base_joints=None):
+    """Fixed-base (base_joints must be empty -- see below) joint solve for a pick-and-place
+    action's TWO keyframes together, rather than as two independent rai_ik() calls. Matches the
+    addModeSwitch pattern from vhartman/multirobot-pathplanning-benchmark's rai_config.py (e.g.
+    compute_pick_and_place): a 2-phase KOMO problem with kOrder=1 (velocity continuity across the
+    phase boundary) and an explicit ry.SY.stable mode switch making the object rigidly follow the
+    gripper from phase 1 onward, so the SAME grasp offset determined at phase 1 (grasp) is what
+    determines where the object ends up at phase 2 (place) -- rather than rai_ik() solving grasp
+    and place independently, which can (and empirically does, for a top/side grasp's free
+    rotation about the approach axis) land on two different valid touching geometries, so an arm
+    that reaches BOTH confs exactly still leaves the object several cm off its intended placement
+    pose. Verified in isolation against a real scenario: with the two confs applied through the
+    same C.setJointState()+C.attach() replay mechanism this codebase actually uses, the object's
+    final position/orientation error against place_pose was sub-millimeter (vs. ~5-14cm from two
+    independent rai_ik() calls).
+
+    place_pose: (position, quaternion) the object's frame should have once placed (e.g. from
+    sample_placement()).
+    Returns (grasp_conf, place_conf) arm-joint tuples, or (None, None) if infeasible.
+
+    Only supports a fixed-mount arm (base_joints falsy): a moving base would need its own DOF in
+    the 2-phase optimization (the base could legitimately reposition between pick and place),
+    which this doesn't attempt -- callers with a mobile base should keep using rai_ik() twice."""
+    C = _config_of(robot)
+    arm_joints, gripper_frame, base_joints, _ = _spec_of(robot, arm_joints, gripper_frame, base_joints)
+    if base_joints:
+        raise NotImplementedError("rai_pick_place_ik() only supports a fixed-mount arm (no base_joints)")
+    original_joints = list(C.getJointNames())
+    C.selectJoints(arm_joints)
+    try:
+        lower, upper = get_custom_limits(C, arm_joints, custom_limits)
+        place_pos, place_quat = place_pose
+        for attempt in range(max_attempts):
+            komo = ry.KOMO(C, phases=2, slicesPerPhase=1, kOrder=1, enableCollisions=True)
+            komo.addControlObjective([], 0, 1e-1)
+            komo.addControlObjective([], 1, 1e-1)
+            komo.addObjective([1, 2], ry.FS.accumulatedCollisions, [], ry.OT.sos, [3e1])
+
+            komo.addObjective([1], ry.FS.negDistance, [gripper_frame, grasp.obj_frame_name],
+                              ry.OT.eq, [1e1])
+            # See rai_ik()'s comment on _GRASP_ALIGN: two constraints, not one, so the squeeze
+            # axis is pinned parallel to an object edge rather than free to rotate to any yaw.
+            for align_fs in _GRASP_ALIGN.get(grasp.grasp_type, _GRASP_ALIGN['side']):
+                komo.addObjective([1], align_fs, [gripper_frame, grasp.obj_frame_name],
+                                  ry.OT.eq, [1e1], [0.0])
+            # See rai_ik()'s comment on _GRASP_CENTER_AXIS: centers the gripper along the squeeze
+            # axis instead of leaving it anywhere negDistance is satisfied (up to the object's edge).
+            center_row = _GRASP_CENTER_AXIS.get(grasp.grasp_type, _GRASP_CENTER_AXIS['side'])
+            komo.addObjective([1], ry.FS.positionRel, [gripper_frame, grasp.obj_frame_name],
+                              ry.OT.eq, center_row * 1e1)
+
+            komo.addModeSwitch([1, 2], ry.SY.stable, [gripper_frame, grasp.obj_frame_name])
+            komo.addObjective([2], ry.FS.position, [grasp.obj_frame_name], ry.OT.eq, [1e1], list(place_pos))
+            komo.addObjective([2], ry.FS.quaternion, [grasp.obj_frame_name], ry.OT.eq, [1e1], list(place_quat))
+
+            if attempt > 0:
+                x_init = np.random.uniform(lower, upper)
+                komo.initWithConstant(x_init)
+            ret = ry.NLP_Solver(komo.nlp(), verbose=0).solve()
+            ret = ret.dict()
+            if view:
+                komo.view(True, 'Pick-place IK attempt {}'.format(attempt))
+            if ret['ineq'] < 1 and ret['eq'] < 1 and ret['feasible']:
+                path = komo.getPath()
+                grasp_conf, place_conf = tuple(path[0]), tuple(path[1])
+                if all_between(lower, grasp_conf, upper) and all_between(lower, place_conf, upper):
+                    return grasp_conf, place_conf
+        return None, None
     finally:
         C.selectJoints(original_joints)
 
@@ -478,6 +606,113 @@ def uniform_pose_generator(C, target_xy, min_radius=0.55, max_radius=0.7):
 
 
 ##### Frame helpers #####
+
+def _gripper_finger_names(gripper_frame):
+    """'l_gripper'/'r_gripper' -> ['l_panda_finger_joint1', 'l_panda_finger_joint2']."""
+    prefix = gripper_frame[:-len('gripper')] if gripper_frame.endswith('gripper') else gripper_frame
+    return [f'{prefix}panda_finger_joint{i}' for i in (1, 2)]
+
+
+_finger_open_local_offset_cache = {}
+
+
+def _finger_open_local_offset(C, gripper_frame, name):
+    """The finger's natural 'fully open' offset from the gripper frame, expressed in the
+    gripper's own local coordinates -- captured once, on first use (from the scenario file's own
+    untouched pose, since this must run before anything moves the arm), and cached that way
+    rather than as a raw world position so it stays valid as the arm/gripper moves later in the
+    replay (a raw world offset, captured once at the start, goes stale and points nowhere near
+    the gripper the moment the arm leaves its initial configuration)."""
+    key = (id(C), name)
+    offset = _finger_open_local_offset_cache.get(key)
+    if offset is None:
+        grip = C.getFrame(gripper_frame)
+        grip_pos = np.asarray(grip.getPosition())
+        R = _quat_to_rotation_matrix(grip.getQuaternion())
+        open_pos = np.asarray(C.getFrame(name).getPosition())
+        offset = R.T @ (open_pos - grip_pos)
+        _finger_open_local_offset_cache[key] = offset
+    return offset
+
+
+def set_gripper_fingers(C, gripper_frame, opening=None):
+    """Moves a gripper's finger frames directly to a world position interpolated between the
+    scenario file's own natural 'fully open' pose (captured once, on first use, before any
+    animation touches them) and the gripper's own reference point. `opening` is the desired
+    half-gap in meters (None, or >= the natural half-gap, means fully open; 0 means fully
+    closed, touching at the gripper's own point).
+
+    The Panda's finger joints are joint_active: False by default in panda.g/pandasTable.g and
+    mimic-linked to each other in the .g file; reactivating them as independent transY DOFs via
+    frame.setJoint() and driving them through C.setJointState() was tried first but doesn't
+    work here -- both fingers collapsed onto the identical world position for every input
+    (confirmed empirically: (0,0), (0.02,0.02) and (0.04,0.04) all produced zero gap between
+    them), because RAI keeps honoring the original mimic linkage regardless of the explicit
+    per-joint values passed in. This bypasses the joint/mimic system entirely and just
+    repositions the frames directly -- purely visual, same mechanism already relied on
+    elsewhere in this module for repositioning objects after C.attach()."""
+    C = _config_of(C)
+    grip = C.getFrame(gripper_frame)
+    grip_pos = np.asarray(grip.getPosition())
+    R = _quat_to_rotation_matrix(grip.getQuaternion())
+    for name in _gripper_finger_names(gripper_frame):
+        f = C.getFrame(name)
+        if f is None:
+            continue
+        local_offset = _finger_open_local_offset(C, gripper_frame, name)
+        natural = np.linalg.norm(local_offset)
+        if natural < 1e-9:
+            continue
+        target = natural if opening is None else min(max(opening, 0.0), natural)
+        f.setPosition(grip_pos + R @ (local_offset / natural * target))
+
+
+def gripper_finger_axis(C, gripper_frame):
+    """World-frame unit direction the gripper's fingers separate along, derived from finger1's
+    natural local offset (the same cached offset set_gripper_fingers uses) rotated by the
+    gripper's current orientation. Used to compute the correct finger-closing width for a held
+    object via box_support_distance -- the object's footprint across this specific direction,
+    not just its narrowest local dimension, since a top/side grasp permits free rotation around
+    the approach axis and the box's local X/Y sizes don't track that rotation."""
+    C = _config_of(C)
+    name = _gripper_finger_names(gripper_frame)[0]
+    local_offset = _finger_open_local_offset(C, gripper_frame, name)
+    norm = np.linalg.norm(local_offset)
+    if norm < 1e-9:
+        return np.array([0.0, 1.0, 0.0])
+    grip = C.getFrame(gripper_frame)
+    R = _quat_to_rotation_matrix(grip.getQuaternion())
+    return R @ (local_offset / norm)
+
+
+def _quat_to_rotation_matrix(quat):
+    w, x, y, z = quat
+    return np.array([
+        [1 - 2 * (y * y + z * z), 2 * (x * y - z * w), 2 * (x * z + y * w)],
+        [2 * (x * y + z * w), 1 - 2 * (x * x + z * z), 2 * (y * z - x * w)],
+        [2 * (x * z - y * w), 2 * (y * z + x * w), 1 - 2 * (x * x + y * y)],
+    ])
+
+
+def box_support_distance(direction_world, quat, size):
+    """Distance from a box's center to its own surface along a world-frame direction, for a box
+    with the given orientation and full extents `size`. Standard box-support formula: rotate the
+    direction into the box's own local frame, then the exit distance for an axis-aligned box of
+    half-extents h along a unit direction d is 1 / max_i(|d_i| / h_i). Verified empirically
+    against real KOMO negDistance=0 grasp solves (mm_drrt_ik-style top grasps): this matches the
+    solved gripper-to-object distance to within ~1mm, with no extra clearance term needed."""
+    direction_world = np.asarray(direction_world, dtype=float)
+    norm = np.linalg.norm(direction_world)
+    if norm < 1e-9:
+        return float(np.max(size) / 2.0)
+    direction_world = direction_world / norm
+    R = _quat_to_rotation_matrix(quat)
+    local_dir = R.T @ direction_world
+    half = np.asarray(size) / 2.0
+    ratios = np.abs(local_dir) / np.maximum(half, 1e-9)
+    denom = np.max(ratios)
+    return 1.0 / denom if denom > 1e-9 else float(np.max(half))
+
 
 def remove_frame(C, frame_name):
     _config_of(C).delFrame(frame_name)
