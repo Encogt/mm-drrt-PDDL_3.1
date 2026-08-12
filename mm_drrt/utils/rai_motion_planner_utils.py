@@ -112,6 +112,34 @@ def replay_composite_path(C, composite_path, joints, release_targets, gripper_fr
     currently_attached = [None] * num_robots
     for gf in gripper_frames:
         ru.set_gripper_fingers(C, gf)
+    # Minimum safe world-Z for a CARRIED object, from whichever table-like frame(s) this scenario
+    # defines (name starting with 'table' -- the two-robot env's single 'table', or the
+    # single-robot env's 'table0'/'table1'; matched by prefix rather than one fixed name so this
+    # generalizes across both). The retrieval/approach-with-attachment motion is planned via
+    # joint-space PRM interpolation, which doesn't guarantee a sensible Cartesian trajectory for
+    # the (rigidly attached) held object between two validated joint-space waypoints. Confirmed
+    # via direct instrumentation on a real run: one of the planner's own validated waypoints had
+    # the carried box penetrating the table by ~2cm -- a real, detectable collision (confirmed
+    # with C.computeCollisions() on that exact replayed pose) that neither the default
+    # collision-checking resolution nor a 3x-finer one caught during planning. Rather than chase
+    # that gap through the shared PRM library, this clamps it defensively at replay time:
+    # whenever a carried object's world Z would put it below the highest table's top surface
+    # (plus its own half-extent, so its actual underside can't dip through), snap it back up,
+    # keeping X/Y untouched -- i.e. only correct the part that visibly reads as "sinking into the
+    # floor". Uses the single highest table top across every table-like frame rather than
+    # figuring out which table (if any) the object is currently over, since that's a simple,
+    # always-safe over-approximation for scenarios (both RAI envs, currently) where every table
+    # sits at the same height.
+    #
+    # Tried instead filtering/bridging the ARM's own waypoints so it would never reach an unsafe
+    # config in the first place (keeping the object rigidly attached throughout, no independent
+    # correction needed) -- reverted: that approach risked dropping or altering a node's true
+    # final waypoint (the exact grasp/place conf the composite-path tightening pass,
+    # rai_drrt_star.py, carefully aligned onto), which visibly broke grasp centering. This
+    # simpler correction only ever touches the object's own position, never the arm's path.
+    table_tops = [f.getPosition()[2] + f.getSize()[2] / 2.0 for f in C.getFrames()
+                 if f.name.startswith('table') and len(f.getSize()) >= 3]
+    table_top = max(table_tops) if table_tops else None
     for node in composite_path:
         n_j = get_max_length_list(node.sub_local_paths)
         for j in range(n_j):
@@ -121,6 +149,26 @@ def replay_composite_path(C, composite_path, joints, release_targets, gripper_fr
                     continue
                 q = path_r[-1] if len(path_r) <= j else path_r[j]
                 ru.set_joint_positions(C, joints[r], q)
+            if table_top is not None:
+                for r in range(num_robots):
+                    if not currently_attached[r]:
+                        continue
+                    obj_frame = C.getFrame(currently_attached[r])
+                    pos = obj_frame.getPosition()
+                    # No safety margin beyond the natural resting height (table_top + half-extent,
+                    # zero clearance) -- matching the exact formula the release branch below uses
+                    # for "resting exactly on the surface" (rest_z). A held object naturally sits
+                    # at this same zero-clearance height the instant it's grasped, before the arm
+                    # has actually lifted it -- adding any positive margin here means that very
+                    # first post-grasp waypoint always reads as "penetrating" and gets yanked up,
+                    # which is exactly the spurious "block dips when grabbed" pop this was
+                    # confirmed (via instrumentation: fired once, at exactly the margin's value, on
+                    # every seed regardless of path) to cause. Still correctly catches genuine
+                    # mid-carry penetration (pos[2] actually below this height), just no longer
+                    # flags the normal, correct starting pose as one.
+                    min_z = table_top + np.max(obj_frame.getSize()[:3]) / 2.0
+                    if pos[2] < min_z:
+                        obj_frame.setPosition([pos[0], pos[1], min_z])
             C.view(False)
             time.sleep(pause_time)
         # Attach/detach checked once per node, at its LAST waypoint -- not at every waypoint
@@ -165,7 +213,25 @@ def replay_composite_path(C, composite_path, joints, release_targets, gripper_fr
                 dist = np.linalg.norm(offset)
                 direction = offset / dist if dist > 1e-6 else np.array([0.0, 0.0, -1.0])
                 target_dist = ru.box_support_distance(direction, obj_quat, obj_size)
-                _animate_to_pose(C, held, grip_pos + direction * target_dist, obj_quat, pause_time)
+                attach_target = grip_pos + direction * target_dist
+                # node.attachments[r] is checked once per node, at its LAST waypoint (see the
+                # comment above this loop), so `held` can flip true before the gripper has
+                # actually finished descending to the true grasp_conf -- confirmed via
+                # instrumentation on a real 2-robot handoff run: at the exact waypoint this fired,
+                # grip_pos was still 4.3cm from the object while target_dist (the correct
+                # FINAL touching offset) was 7.5cm, so extrapolating grip_pos - direction *
+                # target_dist overshot straight through the object's already-correct resting pose
+                # and out the other side -- 3.2cm below the table's surface. _animate_to_pose then
+                # smoothly dragged the box down into the table over its interpolation, which is
+                # exactly the "block dips below the table, then pops back up" visible bug (the pop
+                # being the *next* node's own table_top floor clamp -- below, in the main
+                # per-waypoint loop -- finally catching the too-low box once the gripper's genuine
+                # upward motion carries it back past the resting height). That floor clamp doesn't
+                # cover this animation at all, so apply the same floor here.
+                if table_top is not None:
+                    min_z = table_top + np.max(obj_size) / 2.0
+                    attach_target[2] = max(attach_target[2], min_z)
+                _animate_to_pose(C, held, attach_target, obj_quat, pause_time)
                 currently_attached[r] = held
                 # Finger opening width also uses box_support_distance, along the direction the
                 # fingers actually separate on (rai_utils.gripper_finger_axis) rather than the

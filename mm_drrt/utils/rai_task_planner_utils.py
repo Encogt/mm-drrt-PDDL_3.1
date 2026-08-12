@@ -238,6 +238,21 @@ def individual_path_computation(robot_plans, env, num_base_samples, num_arm_samp
                     print('In Step 3: '+ str(action) + ' is refined')
             else:
                 print(f"Step 3: {action.name} failed after {time.time() - action_start:.2f}s")
+                # Must restore before returning, not just on the success path below: a 'transit'
+                # action's compute_path (example_two_robots_rai_env.py) permanently attaches the
+                # grasped object to the gripper with no matching detach of its own (that only
+                # happens in the transfer action right after it) -- RAI's attach() is a
+                # persistent kinematic-tree reparent. If a LATER action then fails here, the
+                # object is left attached to whatever gripper last grabbed it, and plan_refinement's
+                # outer retry loop (plan_refinement() in rai_task_planner.py: "if not result:
+                # continue") has no way to undo that -- it just re-runs Step 1/2 on top of the
+                # already-corrupted world, so the object stays wrongly attached (and its world
+                # pose stays wherever that gripper's mid-planning conf happened to leave it)
+                # through every subsequent retry, including whichever one eventually succeeds.
+                # Confirmed via instrumentation: a 2-robot 1-object run where the second robot's
+                # transfer failed after its transit had already attached the object left that
+                # object's replayed starting pose meters away from its true one.
+                env.restore_world(init_world)
                 return False, [], []
         roadmaps.append(each_roadmaps)
         heuristic_vals.append(each_heuristic_vals)

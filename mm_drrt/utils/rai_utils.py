@@ -434,17 +434,37 @@ _GRASP_ALIGN = {
     'side': (ry.FS.scalarProductXX, ry.FS.scalarProductXY),
 }
 
-# Row selector (for a positionRel equality objective) picking out the one object axis each
-# grasp_type's squeeze aligns with (matches _GRASP_ALIGN above) -- negDistance alone only
-# requires the gripper to touch the object SOMEWHERE, not centered along that axis, so without
-# this a solve can converge anywhere from dead-center to right at the object's edge (confirmed
-# empirically: world-frame offset along the squeeze axis ranged +-0.035, i.e. the object's full
-# half-width, across repeated solves of the same grasp). This pins it to exactly 0.
-_GRASP_CENTER_AXIS = {
-    'top': np.array([[1, 0, 0]]),
-    'side': np.array([[0, 0, 1]]),
+# Row selector (for a positionRel equality objective) picking out the object axes to center the
+# gripper on -- negDistance alone only requires the gripper to touch the object SOMEWHERE, so
+# without this a solve can converge anywhere from dead-center to right at the object's edge
+# (confirmed empirically, one axis at a time: world-frame offset ranged +-0.035 along the squeeze
+# axis and +-0.025 along the other in-plane axis, i.e. the object's full half-width each way,
+# across repeated solves of the same grasp). Centers TWO of the object's three axes: the squeeze
+# axis itself (matches _GRASP_ALIGN above) and the other in-plane axis -- leaving only the
+# approach/depth axis unconstrained, since THAT one is where negDistance's touching-the-surface
+# distance has to live (fully centering all three would force the gripper's marker to the
+# object's own center, i.e. deep inside it, directly contradicting negDistance==0).
+_GRASP_CENTER_AXES = {
+    'top': np.array([[1, 0, 0], [0, 1, 0]]),
+    'side': np.array([[0, 0, 1], [1, 0, 0]]),
 }
 
+# Row selector + minimum value (for a positionRel inequality objective) constraining the
+# UNcentered approach/depth axis (see _GRASP_CENTER_AXES above) to be strictly positive -- i.e.
+# the gripper must sit on ONE particular side of the object, not either. Without this, negDistance
+# is satisfied just as well by the mirror-image solution (e.g. for 'top', touching the box's
+# BOTTOM face instead of its top, gripper below the object's center) -- confirmed empirically:
+# roughly 1 in 5 solves converged to a negative-depth ("from below") grasp instead of the intended
+# from-above one, and since that requires the arm to reach below the table the box sits on, replay
+# showed the box dipping under the floor to reach that (kinematically valid but physically
+# nonsensical) grasp, briefly during the carry and again right
+# before release. 0.02 is a modest clearance, not a precise value -- it only needs to be small
+# enough not to conflict with the centering equality objectives above and large enough to rule out
+# the near-zero boundary between the two mirror solutions.
+_GRASP_DEPTH_AXIS = {
+    'top': (np.array([[0, 0, 1]]), 0.02),
+    'side': (np.array([[0, 1, 0]]), 0.02),
+}
 
 def rai_ik(robot, base_conf, grasp, custom_limits={}, view=False, max_attempts=6,
           arm_joints=None, gripper_frame=None, base_joints=None):
@@ -489,11 +509,16 @@ def rai_ik(robot, base_conf, grasp, custom_limits={}, view=False, max_attempts=6
             for align_fs in _GRASP_ALIGN.get(grasp.grasp_type, _GRASP_ALIGN['side']):
                 komo.addObjective([1], align_fs, [gripper_frame, grasp.obj_frame_name],
                                   ry.OT.eq, [1e1], [0.0])
-            # Centers the gripper along the squeeze axis (see _GRASP_CENTER_AXIS above) --
-            # negDistance only requires touching the object somewhere, not centered.
-            center_row = _GRASP_CENTER_AXIS.get(grasp.grasp_type, _GRASP_CENTER_AXIS['side'])
+            # Centers the gripper on the object's two in-plane axes (see _GRASP_CENTER_AXES
+            # above) -- negDistance only requires touching the object somewhere, not centered.
+            center_rows = _GRASP_CENTER_AXES.get(grasp.grasp_type, _GRASP_CENTER_AXES['side'])
             komo.addObjective([1], ry.FS.positionRel, [gripper_frame, grasp.obj_frame_name],
-                              ry.OT.eq, center_row * 1e1)
+                              ry.OT.eq, center_rows * 1e1)
+            # Rules out the from-below mirror-image grasp on the remaining (depth) axis --
+            # see _GRASP_DEPTH_AXIS above.
+            depth_row, depth_min = _GRASP_DEPTH_AXIS.get(grasp.grasp_type, _GRASP_DEPTH_AXIS['side'])
+            komo.addObjective([1], ry.FS.positionRel, [gripper_frame, grasp.obj_frame_name],
+                              ry.OT.ineq, depth_row * (-1e1), [depth_min])
             if attempt > 0:
                 x_init = np.random.uniform(lower, upper)
                 komo.initWithConstant(x_init)
@@ -556,11 +581,17 @@ def rai_pick_place_ik(robot, grasp, place_pose, custom_limits={}, view=False, ma
             for align_fs in _GRASP_ALIGN.get(grasp.grasp_type, _GRASP_ALIGN['side']):
                 komo.addObjective([1], align_fs, [gripper_frame, grasp.obj_frame_name],
                                   ry.OT.eq, [1e1], [0.0])
-            # See rai_ik()'s comment on _GRASP_CENTER_AXIS: centers the gripper along the squeeze
-            # axis instead of leaving it anywhere negDistance is satisfied (up to the object's edge).
-            center_row = _GRASP_CENTER_AXIS.get(grasp.grasp_type, _GRASP_CENTER_AXIS['side'])
+            # See rai_ik()'s comment on _GRASP_CENTER_AXES: centers the gripper on the object's
+            # two in-plane axes instead of leaving it anywhere negDistance is satisfied (up to
+            # the object's edge).
+            center_rows = _GRASP_CENTER_AXES.get(grasp.grasp_type, _GRASP_CENTER_AXES['side'])
             komo.addObjective([1], ry.FS.positionRel, [gripper_frame, grasp.obj_frame_name],
-                              ry.OT.eq, center_row * 1e1)
+                              ry.OT.eq, center_rows * 1e1)
+            # See rai_ik()'s comment on _GRASP_DEPTH_AXIS: rules out the from-below mirror-image
+            # grasp on the remaining (depth) axis.
+            depth_row, depth_min = _GRASP_DEPTH_AXIS.get(grasp.grasp_type, _GRASP_DEPTH_AXIS['side'])
+            komo.addObjective([1], ry.FS.positionRel, [gripper_frame, grasp.obj_frame_name],
+                              ry.OT.ineq, depth_row * (-1e1), [depth_min])
 
             komo.addModeSwitch([1, 2], ry.SY.stable, [gripper_frame, grasp.obj_frame_name])
             komo.addObjective([2], ry.FS.position, [grasp.obj_frame_name], ry.OT.eq, [1e1], list(place_pos))

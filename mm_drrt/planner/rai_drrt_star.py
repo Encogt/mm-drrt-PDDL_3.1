@@ -13,6 +13,7 @@ from mm_drrt.utils.motion_planner_utils import OptimalNode, get_angle, \
 
 from mm_drrt.utils.rai_motion_planner_utils import get_inter_robots_collision_fn
 from mm_drrt.utils import rai_utils as ru
+from external.pybullet_planning.motion.motion_planners.smoothing import smooth_path_old
 
 
 def get_subattachments(array, subprob_id, nodes):
@@ -318,8 +319,190 @@ class dRRTStar:
         else:
             raise SystemExit('TIMEOUT: dRRT* is NOT solved.')
         final_path = get_node_from_tree(self.nodes, get_substarts_subgoals(self.goals, self.subprob_id, self.joint_dim), self.subprob_id).retrace()
+        self._shortcut_composite_path(final_path)
         self._tighten_composite_path(final_path)
         return final_path
+
+    def _shortcut_composite_path(self, composite_path):
+        """dRRT*'s composite tree-growth builds a path via randomized sampling, which finds SOME
+        collision-free route through a robot's own roadmap but not necessarily a direct one --
+        confirmed via instrumentation on the 2-robot relay: one robot's pre-grasp approach
+        genuinely zigzagged (dropped from carry height to a low point, rose back up, then
+        descended again to the actual grasp point) rather than descending once, directly, the way
+        the SAME approach did on other random seeds. This is a well-known characteristic of
+        sampling-based planners in general (RRT*/PRM), not a bug specific to one segment or
+        action -- so this is a general post-processing pass, applied to every real (non-trivial)
+        per-robot segment of the solved path: try a single direct joint-space connection from the
+        segment's first waypoint straight to its last, and use it in place of the original
+        multi-node route if it's both shorter and collision-free.
+
+        Runs BEFORE _tighten_composite_path (whose own job -- snapping the very last waypoint of
+        a segment exactly onto the roadmap's true final_conf -- still needs to happen afterward,
+        regardless of whether this pass touched that segment)."""
+        prev_ids = list(composite_path[0].subprob_id)
+        group_start = [0] * self.num_robots
+        for idx in range(1, len(composite_path)):
+            node = composite_path[idx]
+            for r in range(self.num_robots):
+                new_id = node.subprob_id[r]
+                if new_id <= prev_ids[r]:
+                    continue
+                # roadmap_id must be prev_ids[r] (the id active for this WHOLE group), not
+                # new_id - 1: when a trivial (zero-length) roadmap segment gets skipped over in a
+                # single dRRT* growth step (subprob_id jumping by more than 1, e.g. 2 -> 4 because
+                # id 3 is an instantaneous attach placeholder), new_id - 1 names the SKIPPED
+                # trivial segment, not the real one this group's waypoints actually belong to --
+                # confirmed via instrumentation: this silently caused the exact segment right
+                # before a grasp (immediately followed by a trivial attach placeholder) to never
+                # be shortcut at all, on every seed, for whichever robot's action sequence
+                # happened to contain that placeholder.
+                self._shortcut_group(composite_path, group_start[r], idx, r, prev_ids[r])
+                prev_ids[r] = new_id
+                # Node `idx` reports the NEW subprob_id, but its own sub_local_paths[r] are the
+                # waypoints that complete the OLD segment (roadmap_id=new_id-1, just shortcut
+                # above) -- it belongs entirely to that group. Starting the next group at `idx`
+                # instead of `idx + 1` would re-include it and let the next shortcut overwrite it
+                # a second time, severing the two segments at their shared boundary (confirmed:
+                # this is what produced the "teleporting" regression).
+                group_start[r] = idx + 1
+        last_idx = len(composite_path) - 1
+        for r in range(self.num_robots):
+            if group_start[r] < last_idx:
+                self._shortcut_group(composite_path, group_start[r], last_idx, r, prev_ids[r])
+
+    def _shortcut_group(self, composite_path, start_idx, end_idx, r, roadmap_id):
+        """Tries to simplify robot r's own path across composite_path[start_idx:end_idx+1]
+        (every composite-tree node spanning one real per-robot roadmap segment) using
+        smooth_path_old -- the same randomized shortcutting algorithm this codebase's own PRM
+        machinery is built alongside (motion_planners/smoothing.py), rather than a hand-rolled
+        version: it repeatedly tries random (i, j) waypoint pairs and replaces path[i:j+1] with
+        a direct connection whenever that's both shorter and collision-free, which can find
+        PARTIAL shortcuts even when a single first-to-last connection is blocked (confirmed
+        directly: a naive first-to-last-only version of this rejected the exact zigzag this was
+        built to fix, since going straight from the segment's start to its end really does
+        collide with something -- but random-pair shortcutting still simplifies the parts of the
+        detour that aren't actually necessary).
+
+        Collision-checked against the SAME collision_fn the roadmap segment itself was built and
+        validated with (obstacles, attachments, self-collision all already correctly configured
+        there -- e.g. a 'carrying the object' segment's collision_fn already knows to exclude the
+        held object from counting as an obstacle against itself), plus an inter-robot check
+        against every other robot's frozen position at every node the group spans
+        (over-conservative -- checks candidate waypoints against EVERY node in the group, not
+        just chronologically-matched ones -- but simple and safe).
+
+        If anything changed, redistributes the resulting path's waypoints back across the SAME
+        nodes (in roughly equal per-node chunks) rather than dumping them all into one node, so
+        robot r's pacing relative to other robots' own concurrent motion stays reasonable instead
+        of robot r visibly freezing through most of the group and then doing all its motion in a
+        single node."""
+        if roadmap_id < 0:
+            return
+        roadmap = self.roadmaps[r][roadmap_id]
+        if roadmap.initial_conf == roadmap.final_conf:
+            return  # trivial placeholder segment (get_trivial_roadmap): nothing to shortcut
+        expand_type = getattr(roadmap, 'expand_type', None)
+        expand_dim = getattr(roadmap, 'expand_dim', 0)
+        # Arm-only/base-only segments (e.g. transit-with-fixed-arm, or grasp/place fine motion
+        # with a fixed base): the roadmap's own collision_fn was built against the REDUCED joint
+        # set (sub_plan_joint_motion passes just arm_joints or base_joints), but
+        # node.sub_local_paths[r] stores the PADDED, full-per-robot-joint waypoints. Confirmed
+        # empirically (mm_drrt/planner/prm.py's DegreePRM/prm() factory) the padded layout is
+        # ALWAYS (base_joints..., arm_joints...) regardless of expand_type, and expand_type names
+        # which half is FIXED (constant across the whole roadmap, stored as expand_configs) --
+        # 'arm' fixes the trailing arm_joints slice (the base varies), 'base' fixes the leading
+        # base_joints slice (the arm varies) -- matching exactly the slicing DegreePRM.grow()
+        # itself does before calling its own collision_fn (v1.q[:-expand_dim] / v1.q[expand_dim:]).
+        # Reduce candidate waypoints the same way before checking collision, instead of skipping
+        # this segment type outright (skipping left the single-robot scenario's carry motion with
+        # no cleanup at all -- confirmed via instrumentation to zigzag between carry height and
+        # near-table height multiple times, tripping the table clamp 20+ times in a row, reading
+        # as a long visible stutter right at the point the object should just be lifting away).
+        # extend_fn/smooth_path_old still operate on the FULL padded waypoints (fine: the fixed
+        # half is identical at every waypoint by construction, so interpolating it is a no-op).
+        if expand_type == 'arm':
+            def reduce_q(q):
+                return q[:len(q) - expand_dim]
+        elif expand_type == 'base':
+            def reduce_q(q):
+                return q[expand_dim:]
+        else:
+            def reduce_q(q):
+                return q
+        # The root node (composite_path[0]) was built with path=[] rather than a per-robot list
+        # of empty sub-paths (dRRTStar.__init__), so it has no r'th entry to index at all --
+        # exclude it (and defensively, anything else shaped the same way) rather than crash on it.
+        group = [n for n in composite_path[start_idx:end_idx + 1] if len(n.sub_local_paths) > r]
+        if len(group) < 2:
+            return
+        all_q = []
+        for node in group:
+            all_q.extend(node.sub_local_paths[r])
+        if len(all_q) < 3:
+            return
+        extend_fn = ru.get_extend_fn(self.robots[r], self.joints[r])
+
+        def combined_collision_fn(q):
+            if roadmap.collision_fn(reduce_q(q)):
+                return True
+            # Checking only node.sub_config (each node's single boundary snapshot) missed real
+            # collisions: within one composite node the OTHER robot can have its own multi-waypoint
+            # sub_local_paths. Check against every other robot's own waypoint across the group,
+            # not just each node's boundary state.
+            for node in group:
+                for r2 in range(self.num_robots):
+                    if r2 == r:
+                        continue
+                    other_path = node.sub_local_paths[r2] if len(node.sub_local_paths) > r2 else None
+                    other_confs = other_path if other_path else [node.sub_config[r2]]
+                    for other_q in other_confs:
+                        q_check = list(node.sub_config)
+                        q_check[r] = q
+                        q_check[r2] = other_q
+                        if self.inter_robots_collision_fn(q_check, mode='boolean'):
+                            return True
+            return False
+
+        smoothed = smooth_path_old(all_q, extend_fn, combined_collision_fn, max_iterations=50)
+        if not smoothed or len(smoothed) >= len(all_q):
+            return
+        chunks = np.array_split(np.arange(len(smoothed)), len(group))
+        new_sub_paths = [[smoothed[i] for i in chunk] for chunk in chunks]
+        # combined_collision_fn only ever sees NEWLY interpolated candidate points -- any stretch
+        # of `all_q` that smooth_path_old leaves untouched (most of it, typically: it only
+        # replaces the spans it actually shortcuts) was validated once, during ordinary tree
+        # growth, against whatever the OTHER robot was doing at THAT time. Redistributing the
+        # smoothed result evenly across the group's nodes can relocate that same, already-"safe"
+        # stretch of waypoints into a DIFFERENT node than the one it was validated against --
+        # e.g. real motion originally confined entirely to this group's LAST node (the other
+        # robot's true concurrent state there) ends up smeared backward into EARLIER nodes, where
+        # a completely different (and never-checked-against) state of the other robot is playing
+        # out. Confirmed via instrumentation on the 2-object crossing relay: disabling this whole
+        # shortcut pass made an otherwise fully deterministic run's l_palm/r_palm collisions (up
+        # to 13cm penetration) disappear entirely, proving the raw pre-shortcut path was already
+        # collision-free and that this redistribution -- not the pre-check above -- was what
+        # reintroduced them. So re-validate the FINAL, redistributed, per-node result using the
+        # exact same hold-last-waypoint padding replay itself uses (matching
+        # motion_planner_utils.is_local_collision), and silently keep the original (already
+        # proven safe) paths for this group if it doesn't hold up.
+        for node, new_path in zip(group, new_sub_paths):
+            for r2 in range(self.num_robots):
+                if r2 == r:
+                    continue
+                other_path = node.sub_local_paths[r2] if len(node.sub_local_paths) > r2 else None
+                other_confs = other_path if other_path else [node.sub_config[r2]]
+                n_check = max(len(new_path), len(other_confs))
+                for i in range(n_check):
+                    q_r = new_path[-1] if i >= len(new_path) else new_path[i]
+                    q_r2 = other_confs[-1] if i >= len(other_confs) else other_confs[i]
+                    q_check = list(node.sub_config)
+                    q_check[r] = q_r
+                    q_check[r2] = q_r2
+                    if self.inter_robots_collision_fn(q_check, mode='boolean'):
+                        return
+        for node, new_path in zip(group, new_sub_paths):
+            node.sub_local_paths[r] = new_path
+        group[-1].sub_config[r] = smoothed[-1]
 
     def _tighten_composite_path(self, composite_path):
         """dRRT*'s composite tree-growth doesn't guarantee a node lands EXACTLY on a per-robot
@@ -350,7 +533,10 @@ class dRRTStar:
                 new_id = node.subprob_id[r]
                 if new_id <= prev_ids[r]:
                     continue
-                old_id = new_id - 1
+                # Same fix as _shortcut_composite_path above: old_id must be prev_ids[r] (captured
+                # before the update below), not new_id - 1, so a skipped trivial placeholder
+                # segment doesn't cause this to tighten the wrong roadmap.
+                old_id = prev_ids[r]
                 prev_ids[r] = new_id
                 roadmap = self.roadmaps[r][old_id]
                 if roadmap.initial_conf == roadmap.final_conf:
