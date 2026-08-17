@@ -35,6 +35,12 @@ parser.add_argument('--use_pddl_planner', action='store_true', help='Use automat
 parser.add_argument('--pddl_timeout', type=int, default=30, help='Timeout in seconds for each planner')
 parser.add_argument('--transit_duration', type=float, default=10, help='Declared PDDL :duration for transit actions (Tamer path) / naive_duration_executor wait unit')
 parser.add_argument('--transfer_duration', type=float, default=10, help='Declared PDDL :duration for transfer actions (Tamer path) / naive_duration_executor wait unit')
+# Load a HAND-EDITED PDDL domain/problem file pair (mm_drrt/planner/pddl_file_planner.py) and
+# run whatever Tamer solves from it in this RAI env, instead of the normal
+# create_pddl_problem()-generated-in-memory path. No fallback to another planner on
+# failure/unsolvable -- the point is to see how the solver reacts to exactly this text.
+parser.add_argument('--pddl_domain_file', type=str, default=None, help='Path to a hand-edited PDDL domain file; defaults to mm_drrt/pddl/domains/mm_drrt_manipulation.pddl if --pddl_problem_file is set')
+parser.add_argument('--pddl_problem_file', type=str, default=None, help='Path to a hand-edited PDDL problem file, e.g. mm_drrt/pddl/problems/two_robots_relay_problem.pddl -- setting this loads the plan from these files instead of --use_pddl_planner\'s normal chain')
 # exp_duration_conflict_rai only: skip PlanSkeleton/dRRT*'s real inter-robot collision checking
 # and run mm_drrt/utils/naive_duration_executor.py instead, to demonstrate what a wrong
 # --transfer_duration causes when nothing else protects against it. See that module's docstring.
@@ -84,7 +90,23 @@ if opt.naive_playback:
 # directly) first, then classical Fast Downward (via MA-PDDL compilation) if Tamer fails,
 # then the environment's manual plan as the last resort. Mirrors main.py.
 planner_used = None
-if opt.use_pddl_planner:
+if opt.pddl_problem_file:
+    from mm_drrt.planner.pddl_file_planner import generate_plan_from_pddl_files, PDDLFilePlannerError
+    from mm_drrt.planner.tamer_pddl_planner import TamerPlannerError
+    from mm_drrt.planner.pddl_domain import get_domain_file_path
+
+    domain_file = opt.pddl_domain_file or get_domain_file_path()
+    print(f"Solving hand-edited PDDL files: domain={domain_file} problem={opt.pddl_problem_file}")
+    try:
+        plan, action_orders, obj_orders, init_order_constraints = generate_plan_from_pddl_files(
+            env, domain_file, opt.pddl_problem_file, timeout=opt.pddl_timeout)
+    except (PDDLFilePlannerError, TamerPlannerError) as e:
+        print(f"\n{type(e).__name__}: {e}\n\nNo fallback for --pddl_problem_file -- fix the "
+             f"PDDL text and re-run to see how the solver reacts.")
+        disconnect(C)
+        raise SystemExit(1)
+    planner_used = f'Tamer (from PDDL files: {opt.pddl_problem_file})'
+elif opt.use_pddl_planner:
     from mm_drrt.planner.tamer_pddl_planner import TamerPDDLPlanner, TamerPlannerError, has_tamer_pddl_support
     from mm_drrt.planner.pddl_planner import PDDLPlanner, PDDLPlannerError, PDDLTimeoutError, has_pddl_support
 
