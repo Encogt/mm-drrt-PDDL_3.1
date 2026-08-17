@@ -8,6 +8,10 @@ from examples.envs.example_single_robot_rai_env import ExampleSingleRobotRaiEnvi
     ExampleSingleRobotCameraSetup
 from examples.envs.example_two_robots_rai_env import ExampleTwoRobotsRaiEnvironment, \
     ExampleTwoRobotsRaiCameraSetup
+from examples.envs.stack_blocks_rai_env import StackBlocksRaiEnvironment, \
+    StackBlocksRaiCameraSetup
+from examples.envs.duration_conflict_rai_env import DurationConflictRaiEnvironment, \
+    DurationConflictRaiCameraSetup
 from mm_drrt.planner.rai_task_planner import PlanSkeleton
 from mm_drrt.utils.rai_motion_planner_utils import replay_composite_path
 from experiments.data_saver import data_saver
@@ -29,6 +33,12 @@ parser.add_argument('--drrt_time_limit', type=int, default=2000)
 # PDDL planner params
 parser.add_argument('--use_pddl_planner', action='store_true', help='Use automatic planning to generate task plan: tries Tamer first, falls back to Fast Downward -- both PDDL 2.1')
 parser.add_argument('--pddl_timeout', type=int, default=30, help='Timeout in seconds for each planner')
+parser.add_argument('--transit_duration', type=float, default=10, help='Declared PDDL :duration for transit actions (Tamer path) / naive_duration_executor wait unit')
+parser.add_argument('--transfer_duration', type=float, default=10, help='Declared PDDL :duration for transfer actions (Tamer path) / naive_duration_executor wait unit')
+# exp_duration_conflict_rai only: skip PlanSkeleton/dRRT*'s real inter-robot collision checking
+# and run mm_drrt/utils/naive_duration_executor.py instead, to demonstrate what a wrong
+# --transfer_duration causes when nothing else protects against it. See that module's docstring.
+parser.add_argument('--naive_playback', action='store_true', help='exp_duration_conflict_rai only: bypass dRRT* and play back on a naive, duration-trusting schedule')
 
 opt = parser.parse_args()
 print(opt)
@@ -45,10 +55,30 @@ elif opt.env_type == 'exp_two_robots_rai':
     set_camera_pose(C, camera_point=ExampleTwoRobotsRaiCameraSetup[0], target_point=ExampleTwoRobotsRaiCameraSetup[1])
     env = ExampleTwoRobotsRaiEnvironment(num_robots=opt.num_robots, num_objs=opt.num_objs, arm=opt.arm,
                                          grasp_type=opt.grasp_type, sim_id=C, seed=opt.seed)
+elif opt.env_type == 'exp_stack_blocks_rai':
+    set_camera_pose(C, camera_point=StackBlocksRaiCameraSetup[0], target_point=StackBlocksRaiCameraSetup[1])
+    env = StackBlocksRaiEnvironment(num_robots=opt.num_robots, num_objs=opt.num_objs, arm=opt.arm,
+                                    grasp_type=opt.grasp_type, sim_id=C, seed=opt.seed)
+elif opt.env_type == 'exp_duration_conflict_rai':
+    set_camera_pose(C, camera_point=DurationConflictRaiCameraSetup[0], target_point=DurationConflictRaiCameraSetup[1])
+    env = DurationConflictRaiEnvironment(num_robots=opt.num_robots, num_objs=opt.num_objs, arm=opt.arm,
+                                         grasp_type=opt.grasp_type, sim_id=C, seed=opt.seed)
 else:
     raise ValueError('Unsupported env_type for the RAI POC: {}'.format(opt.env_type))
 
 refresh_view(C, use_gui=opt.use_gui)
+
+if opt.naive_playback:
+    if opt.env_type != 'exp_duration_conflict_rai':
+        raise ValueError('--naive_playback is only defined for exp_duration_conflict_rai')
+    from mm_drrt.utils.naive_duration_executor import run_naive_duration_demo
+    run_naive_duration_demo(env, C, transit_duration=opt.transit_duration, transfer_duration=opt.transfer_duration,
+                            num_base_samples=opt.num_base_samples, num_arm_samples=opt.num_arm_samples,
+                            use_debug=opt.use_debug)
+    if opt.use_gui:
+        input("Naive duration demo complete. Press Enter to close...")
+    disconnect(C)
+    raise SystemExit(0)
 
 # Planner preference order when --use_pddl_planner is set: Tamer (solves the UPF problem
 # directly) first, then classical Fast Downward (via MA-PDDL compilation) if Tamer fails,
@@ -61,7 +91,8 @@ if opt.use_pddl_planner:
     if has_tamer_pddl_support(env):
         print("Trying Tamer planner (PDDL 2.1) to generate task plan...")
         try:
-            planner = TamerPDDLPlanner(timeout=opt.pddl_timeout)
+            planner = TamerPDDLPlanner(timeout=opt.pddl_timeout, transit_duration=opt.transit_duration,
+                                       transfer_duration=opt.transfer_duration)
             plan, action_orders, obj_orders, init_order_constraints = planner.generate_plan(env)
             planner_used = 'Tamer (PDDL 2.1)'
         except TamerPlannerError as e:
