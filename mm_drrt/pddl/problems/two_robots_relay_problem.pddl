@@ -35,6 +35,5 @@
     (obj-location box0 table_end)
     (robot-free robot0)
     (robot-free robot1)
-    (robot-at-base robot0)
 ))
 )

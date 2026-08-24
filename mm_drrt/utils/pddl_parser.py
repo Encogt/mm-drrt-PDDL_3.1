@@ -85,12 +85,19 @@ def parse_pddl_plan(pddl_plan, mapper, env):
             action_name = action_info['name']
             obj_orders[obj].append(action_name)
 
-    # Always use sequential constraint extraction: only add a constraint when
-    # robot A transfers object O and a different robot B later transits the same
-    # object O (handoff dependency). extract_temporal_constraints added spurious
-    # constraints between unrelated parallel actions (same end-time, different
-    # objects), which caused wrong ordering in individual_path_computation.
-    init_order_constraints = extract_sequential_constraints(actions_list)
+    # Same-object handoff constraints (robot A transfers object O, robot B later transits the
+    # same O) -- the only thing this pipeline enforced downstream until now.
+    handoff_constraints = extract_sequential_constraints(actions_list)
+    # Cross-robot SAME-SURFACE constraints (see extract_shared_surface_constraints's docstring):
+    # narrower than the old extract_temporal_constraints (removed for producing spurious
+    # constraints between unrelated parallel actions with no shared object OR surface) -- only
+    # pairs that touch the same fixed-obj are considered, so this can't reintroduce that bug.
+    # Deduplicated against handoff_constraints (a handoff pair is usually also same-surface, so
+    # they'd otherwise double up).
+    seen = {(c['pre'], c['post']) for c in handoff_constraints}
+    surface_constraints = tuple(c for c in extract_shared_surface_constraints(actions_list)
+                                if (c['pre'], c['post']) not in seen)
+    init_order_constraints = handoff_constraints + surface_constraints
 
     return plan, dict(action_orders), dict(obj_orders), init_order_constraints
 
@@ -360,6 +367,43 @@ def extract_sequential_constraints(actions_list):
                 constraints.append({'pre': a_i['name'], 'post': a_j['name']})
                 break  # one constraint per transfer is enough
     return tuple(constraints)
+
+
+def extract_shared_surface_constraints(actions_list):
+    """
+    Derive cross-robot ordering constraints from actions that touch the SAME fixed-obj
+    (to_fixed_obj -- the surface a transit picks up FROM or a transfer places ONTO) and don't
+    overlap in the solved plan's own start/end times.
+
+    extract_sequential_constraints only catches a shared-object handoff (robot A transfers
+    object O, robot B later transits that same O). It has no way to notice that two DIFFERENT
+    robots' actions on two DIFFERENT objects were still forced apart in time because they touch
+    the same physical surface -- e.g. mm_drrt_manipulation.pddl's `occupied` mutex serializing a
+    2-object crossing relay's table_mid, where no single object links the two robots' chains.
+    Without this, that serialization is invisible past this function: PlanSkeleton/dRRT* would
+    treat those actions as fully independent, and a :duration edit that changes how Tamer spaces
+    them out would have no effect on the executed plan at all.
+
+    Deliberately narrower than the old extract_temporal_constraints (removed for producing
+    spurious constraints between unrelated parallel actions with no shared object OR surface):
+    only pairs that reference the same fixed-obj are considered here, so it can't reintroduce
+    that bug.
+
+    Note: dRRT*'s own inter_robots_collision_fn (rai_drrt_star.py) already guarantees physical
+    safety regardless of whether this constraint is present -- this is about matching the
+    solver's chosen concurrency/ordering (and therefore making :duration observably affect
+    execution), not about safety.
+    """
+    constraints = []
+    for i, a_i in enumerate(actions_list):
+        for a_j in actions_list[i + 1:]:
+            if a_i['robot'] == a_j['robot']:
+                continue
+            if a_i['to_fixed_obj'] is None or a_i['to_fixed_obj'] != a_j['to_fixed_obj']:
+                continue
+            if a_i['end_time'] <= a_j['start_time']:
+                constraints.append({'pre': a_i['name'], 'post': a_j['name']})
+    return constraints
 
 
 def extract_temporal_constraints(actions_list):
