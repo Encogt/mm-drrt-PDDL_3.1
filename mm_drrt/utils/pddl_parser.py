@@ -8,6 +8,78 @@ init_order_constraints).
 
 from collections import defaultdict
 
+# transit/transfer get split into up to 3 chained sub-actions (approach/occupy/depart) when
+# mm_drrt/planner/pddl_domain.py's region_entry_offset/region_exit_offset narrow the `occupied`
+# mutex to a sub-interval of the action (see that module's docstring). MM-dRRT (PlanSkeleton,
+# dRRT*) is unaware of the split and expects exactly one 'transit'/'transfer' entry per high-level
+# action, so _merge_phased_actions folds a split action's phases back into one before anything
+# downstream sees them.
+_PHASE_SUFFIXES = {'-approach': 0, '-occupy': 1, '-depart': 2}
+
+
+def _split_phase_type(action_type):
+    """('transit-occupy', 1) for a split-domain phase name, else (action_type, None) unchanged."""
+    for suffix, phase_index in _PHASE_SUFFIXES.items():
+        if action_type.endswith(suffix) and action_type[:-len(suffix)] in ('transit', 'transfer'):
+            return action_type[:-len(suffix)], phase_index
+    return action_type, None
+
+
+def _phase_group_key(action_info):
+    surface = action_info['to_fixed_obj'] if action_info['type'] == 'transfer' else action_info['from_fixed_obj']
+    return (action_info['type'], action_info['robot'], action_info['movable_obj'], surface)
+
+
+def _fold_phase_chain(chain):
+    anchor = next(p for p in chain if p['phase_index'] == 1)  # the occupy phase
+    folded = dict(anchor)
+    folded['start_time'] = min(p['start_time'] for p in chain)
+    folded['end_time'] = max(p['end_time'] for p in chain)
+    return folded
+
+
+def _merge_phased_actions(actions_list):
+    """Fold approach/occupy/depart phase chains back into one action per (type, robot, obj,
+    surface) instance.
+
+    Tamer's search is satisficing, not plan-length-optimizing, and can leave dead/incomplete phase
+    chains in a returned plan -- e.g. a spurious extra occupy phase for a surface the robot never
+    actually finishes moving to, alongside the real one it does complete (confirmed via
+    solve_pddl.py on the 2-object crossing relay problem: mm_drrt/pddl/problems/
+    two_robots_crossing_relay_problem.pddl). Whether a depart phase is expected at all for a given
+    base type is inferred from whether one appears ANYWHERE in the plan for that type; an occupy
+    chain for that type that never reaches a depart is such a dead branch and is dropped rather
+    than passed downstream as a half-finished action.
+    """
+    if not any(a.get('phase_index') is not None for a in actions_list):
+        return actions_list
+
+    depart_expected = {a['type'] for a in actions_list if a.get('phase_index') == 2}
+
+    groups = defaultdict(list)
+    merged = [a for a in actions_list if a.get('phase_index') is None]
+    for a in actions_list:
+        if a.get('phase_index') is not None:
+            groups[_phase_group_key(a)].append(a)
+
+    for key, phases in groups.items():
+        phases.sort(key=lambda a: a['start_time'])
+        chain = []
+        for phase in phases:
+            if chain and phase['phase_index'] <= chain[-1]['phase_index']:
+                print(f"Warning: dropping incomplete {chain[0]['type']} phase chain for {key} "
+                     f"({[p['name'] for p in chain]}) -- Tamer's plan never completed it.")
+                chain = []
+            chain.append(phase)
+            if phase['phase_index'] == 2 or (phase['phase_index'] == 1 and phase['type'] not in depart_expected):
+                merged.append(_fold_phase_chain(chain))
+                chain = []
+        if chain:
+            print(f"Warning: dropping incomplete {chain[0]['type']} phase chain for {key} "
+                 f"({[p['name'] for p in chain]}) -- Tamer's plan never completed it.")
+
+    return merged
+
 
 def parse_pddl_plan(pddl_plan, mapper, env):
     """
@@ -44,7 +116,14 @@ def parse_pddl_plan(pddl_plan, mapper, env):
             action_name = f"a{i}"
             action_info = _parse_action(action, action_name, mapper, start_time, start_time + duration)
             actions_list.append(action_info)
-            plan[action_name] = action_info['mm_drrt_format']
+
+        # Fold any transit-approach/-occupy/-depart (or transfer- equivalent) phase chains back
+        # into one action per pick/place before building plan/action_orders/obj_orders below --
+        # see _merge_phased_actions's docstring. No-op unless pddl_domain.py's
+        # region_entry_offset/region_exit_offset actually split the domain's actions.
+        actions_list = sorted(_merge_phased_actions(actions_list), key=lambda a: a['start_time'])
+        for action_info in actions_list:
+            plan[action_info['name']] = action_info['mm_drrt_format']
     elif hasattr(pddl_plan, 'actions'):
         # SequentialPlan (non-temporal actions)
         for i, action in enumerate(pddl_plan.actions):
@@ -186,6 +265,14 @@ def _parameter_name(parameter):
 
 
 def _build_action_info(action_type, parameters, action_name, mapper, start_time, end_time):
+    action_type, phase_index = _split_phase_type(action_type)
+    action_info = _build_unphased_action_info(action_type, parameters, action_name, mapper, start_time, end_time)
+    if action_info is not None:
+        action_info['phase_index'] = phase_index
+    return action_info
+
+
+def _build_unphased_action_info(action_type, parameters, action_name, mapper, start_time, end_time):
     # Extract robot from parameters
     robot_pddl = _parameter_name(parameters[0])
     robot = mapper.get_pybullet_obj(robot_pddl)

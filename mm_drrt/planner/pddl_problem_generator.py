@@ -47,7 +47,10 @@ def _resolve_args(predicate_args, mapper, problem):
     return upf_args
 
 
-def generate_problem(env, save_to_file=False, transit_duration=10, transfer_duration=10):
+def generate_problem(env, save_to_file=False, transit_duration=10, transfer_duration=10,
+                     region_mutex_enabled=False,
+                     transit_region_entry_offset=0, transit_region_exit_offset=None,
+                     transfer_region_entry_offset=0, transfer_region_exit_offset=None):
     """
     Create a PDDL 2.1 temporal problem instance from the environment.
 
@@ -56,6 +59,15 @@ def generate_problem(env, save_to_file=False, transit_duration=10, transfer_dura
         save_to_file: If True, write UPF text representation to mm_drrt/pddl/problems/
         transit_duration: Fixed duration (seconds) for transit (pick) actions
         transfer_duration: Fixed duration (seconds) for transfer (place) actions
+        region_mutex_enabled: If False (default), the generated domain has no region-conflict
+            handling at all -- matches the domain's historic behavior exactly (see
+            create_mm_drrt_domain's docstring; some environments, e.g.
+            DurationConflictRaiEnvironment, depend on this). Must be True for the region_*_offset
+            args below to have any effect.
+        transit_region_entry_offset/transit_region_exit_offset: sub-interval of a transit action
+            (of transit_duration) during which it actually occupies its shared region -- see
+            create_mm_drrt_domain's docstring. Defaults reproduce a full-duration mutex.
+        transfer_region_entry_offset/transfer_region_exit_offset: same, for transfer actions.
 
     Returns:
         (problem, mapper)
@@ -66,7 +78,12 @@ def generate_problem(env, save_to_file=False, transit_duration=10, transfer_dura
     problem = Problem('mm-drrt-problem')
 
     domain          = create_mm_drrt_domain(transit_duration=transit_duration,
-                                            transfer_duration=transfer_duration)
+                                            transfer_duration=transfer_duration,
+                                            region_mutex_enabled=region_mutex_enabled,
+                                            transit_region_entry_offset=transit_region_entry_offset,
+                                            transit_region_exit_offset=transit_region_exit_offset,
+                                            transfer_region_entry_offset=transfer_region_entry_offset,
+                                            transfer_region_exit_offset=transfer_region_exit_offset)
     types           = domain['types']
     boolean_fluents = domain['boolean_fluents']
     actions         = domain['actions']

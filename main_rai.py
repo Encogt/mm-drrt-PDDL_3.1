@@ -35,6 +35,19 @@ parser.add_argument('--use_pddl_planner', action='store_true', help='Use automat
 parser.add_argument('--pddl_timeout', type=int, default=30, help='Timeout in seconds for each planner')
 parser.add_argument('--transit_duration', type=float, default=10, help='Declared PDDL :duration for transit actions (Tamer path) / naive_duration_executor wait unit')
 parser.add_argument('--transfer_duration', type=float, default=10, help='Declared PDDL :duration for transfer actions (Tamer path) / naive_duration_executor wait unit')
+# Minimal temporal constraints (Tamer path only, --use_pddl_planner): opt into the domain's
+# `occupied` region mutex and narrow it from an action's full duration down to [entry_offset,
+# exit_offset] -- the sub-interval during which it actually occupies the shared region -- so two
+# robots conflicting in that region only get forced apart across that sub-interval (si + beta_ik
+# <= sj + alpha_jk, or the reverse), preserving partial overlap between the rest of their
+# high-level actions whenever possible. Off by default: some environments (e.g.
+# DurationConflictRaiEnvironment) depend on the "stock" domain having no region-conflict handling
+# at all. See mm_drrt/planner/pddl_domain.py.
+parser.add_argument('--region_mutex_enabled', action='store_true', help='Enable the PDDL domain\'s occupied-region mutex (off by default; required for the --*_region_*_offset args below to have any effect)')
+parser.add_argument('--transit_region_entry_offset', type=float, default=0, help='Seconds into a transit action before it starts occupying its shared region (alpha for transit)')
+parser.add_argument('--transit_region_exit_offset', type=float, default=None, help='Seconds into a transit action when it stops occupying its shared region (beta for transit); defaults to --transit_duration')
+parser.add_argument('--transfer_region_entry_offset', type=float, default=0, help='Seconds into a transfer action before it starts occupying its shared region (alpha for transfer)')
+parser.add_argument('--transfer_region_exit_offset', type=float, default=None, help='Seconds into a transfer action when it stops occupying its shared region (beta for transfer); defaults to --transfer_duration')
 # Load a HAND-EDITED PDDL domain/problem file pair (mm_drrt/planner/pddl_file_planner.py) and
 # run whatever Tamer solves from it in this RAI env, instead of the normal
 # create_pddl_problem()-generated-in-memory path. No fallback to another planner on
@@ -114,7 +127,12 @@ elif opt.use_pddl_planner:
         print("Trying Tamer planner (PDDL 2.1) to generate task plan...")
         try:
             planner = TamerPDDLPlanner(timeout=opt.pddl_timeout, transit_duration=opt.transit_duration,
-                                       transfer_duration=opt.transfer_duration)
+                                       transfer_duration=opt.transfer_duration,
+                                       region_mutex_enabled=opt.region_mutex_enabled,
+                                       transit_region_entry_offset=opt.transit_region_entry_offset,
+                                       transit_region_exit_offset=opt.transit_region_exit_offset,
+                                       transfer_region_entry_offset=opt.transfer_region_entry_offset,
+                                       transfer_region_exit_offset=opt.transfer_region_exit_offset)
             plan, action_orders, obj_orders, init_order_constraints = planner.generate_plan(env)
             planner_used = 'Tamer (PDDL 2.1)'
         except TamerPlannerError as e:

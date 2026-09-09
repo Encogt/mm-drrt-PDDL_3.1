@@ -58,10 +58,18 @@ class TamerPDDLPlanner:
     4. Error handling and validation
     """
 
-    def __init__(self, timeout=30, transit_duration=10, transfer_duration=10):
+    def __init__(self, timeout=30, transit_duration=10, transfer_duration=10,
+                region_mutex_enabled=False,
+                transit_region_entry_offset=0, transit_region_exit_offset=None,
+                transfer_region_entry_offset=0, transfer_region_exit_offset=None):
         self.timeout = timeout
         self.transit_duration = transit_duration
         self.transfer_duration = transfer_duration
+        self.region_mutex_enabled = region_mutex_enabled
+        self.transit_region_entry_offset = transit_region_entry_offset
+        self.transit_region_exit_offset = transit_region_exit_offset
+        self.transfer_region_entry_offset = transfer_region_entry_offset
+        self.transfer_region_exit_offset = transfer_region_exit_offset
 
     def generate_plan(self, env):
         if not hasattr(env, 'create_pddl_problem'):
@@ -70,8 +78,13 @@ class TamerPDDLPlanner:
             )
 
         try:
-            problem, mapper = generate_problem(env, transit_duration=self.transit_duration,
-                                               transfer_duration=self.transfer_duration)
+            problem, mapper = generate_problem(
+                env, transit_duration=self.transit_duration, transfer_duration=self.transfer_duration,
+                region_mutex_enabled=self.region_mutex_enabled,
+                transit_region_entry_offset=self.transit_region_entry_offset,
+                transit_region_exit_offset=self.transit_region_exit_offset,
+                transfer_region_entry_offset=self.transfer_region_entry_offset,
+                transfer_region_exit_offset=self.transfer_region_exit_offset)
         except Exception as e:
             raise TamerPlannerError(f"Problem generation failed: {e}")
 
