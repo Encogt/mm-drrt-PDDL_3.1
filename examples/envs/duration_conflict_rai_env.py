@@ -258,6 +258,59 @@ class DurationConflictRaiEnvironment(Environment):
     def restore_world(self, saved_world):
         ru.restore_world(saved_world)
 
+    def measure_region_offsets(self, duration=10.0):
+        """Motion-derived alpha_ik/beta_ik for this environment's two conflict-relevant action
+        types (robot0 transiting from zone_left, robot1 transiting from zone_right, both
+        transferring onto the shared drop_pad) -- see
+        mm_drrt/utils/rai_motion_planner_utils.py's sample_region_offsets() for how each one is
+        measured from a real IK/motion-planned trajectory. Collapses the two robots' per-region
+        samples into ONE (alpha, beta) pair per action type: the union (min entry, max exit)
+        across whatever measured successfully, so a region that WAS measured is never
+        under-protected by the collapse -- see mm_drrt/planner/pddl_domain.py's docstring for why
+        this is a domain-wide-constant approximation rather than the fully general per-(robot,
+        region) numeric-fluent mode, and compare_region_constraints_rai_env.py's docstring for why
+        even this collapsed form is used as an ASYMMETRIC reduction (only entry_offset for
+        transit, only exit_offset for transfer) rather than narrowing both sides of both action
+        types at once -- a Tamer search-scaling limit at this environment's size, not a domain
+        soundness issue.
+
+        Returns {'transit': (alpha, beta), 'transfer': (alpha, beta)} -- (0.0, duration) for
+        either action type if no valid grasp/IK/motion sample was found at all (conservative
+        fallback: an unmeasured action type looks like a full-duration mutex, never unprotected).
+
+        Each sample is wrapped in save_world()/restore_world() -- sample_region_offsets() moves
+        the object (placement sampling) and, for 'transit', attaches/detaches it to the gripper,
+        which is real state this method must not leak into the actual scene: this runs BEFORE
+        Tamer/PlanSkeleton, so any leftover pose or attachment would visibly corrupt the object's
+        position for the real plan that follows (confirmed -- without this wrapping, block0 ends
+        up floating at the gripper's approach pose instead of resting in its zone, causing visible
+        teleports/misalignment once the real pipeline runs). Matches the save_world()/
+        restore_world() pattern PlanSkeleton.initialize() and naive_duration_executor.py's
+        _refine_plan already use around their own trial sampling.
+        """
+        from mm_drrt.utils.rai_motion_planner_utils import sample_region_offsets
+
+        samples = {'transit': [], 'transfer': []}
+        for robot, m_obj, region, action_type in [
+            (self.robots[0], self.m_objs[0], self.f_objs[0], 'transit'),
+            (self.robots[1], self.m_objs[1], self.f_objs[1], 'transit'),
+            (self.robots[0], self.m_objs[0], self.f_objs[2], 'transfer'),
+            (self.robots[1], self.m_objs[1], self.f_objs[2], 'transfer'),
+        ]:
+            saved_world = self.save_world()
+            result = sample_region_offsets(robot, self._arm, self._grasp_type, m_obj, region,
+                                           action_type, duration, collision_objs=self.fixed_obstacles)
+            self.restore_world(saved_world)
+            if result is not None:
+                samples[action_type].append(result)
+
+        offsets = {}
+        for action_type in ('transit', 'transfer'):
+            measured = samples[action_type]
+            offsets[action_type] = (min(a for a, b in measured), max(b for a, b in measured)) \
+                if measured else (0.0, duration)
+        return offsets
+
     def _assign_target_obj_pose(self, actions, obj_orders, m_obj, action):
         for a in actions:
             if actions[a] == action:

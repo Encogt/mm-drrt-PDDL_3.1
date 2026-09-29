@@ -50,7 +50,8 @@ def _resolve_args(predicate_args, mapper, problem):
 def generate_problem(env, save_to_file=False, transit_duration=10, transfer_duration=10,
                      region_mutex_enabled=False,
                      transit_region_entry_offset=0, transit_region_exit_offset=None,
-                     transfer_region_entry_offset=0, transfer_region_exit_offset=None):
+                     transfer_region_entry_offset=0, transfer_region_exit_offset=None,
+                     use_region_fluents=False, region_offsets=None):
     """
     Create a PDDL 2.1 temporal problem instance from the environment.
 
@@ -66,8 +67,23 @@ def generate_problem(env, save_to_file=False, transit_duration=10, transfer_dura
             args below to have any effect.
         transit_region_entry_offset/transit_region_exit_offset: sub-interval of a transit action
             (of transit_duration) during which it actually occupies its shared region -- see
-            create_mm_drrt_domain's docstring. Defaults reproduce a full-duration mutex.
+            create_mm_drrt_domain's docstring. Defaults reproduce a full-duration mutex. Under
+            use_region_fluents=True these become the fallback for any fixed-obj region_offsets
+            doesn't have a measurement for, rather than a single domain-wide constant.
         transfer_region_entry_offset/transfer_region_exit_offset: same, for transfer actions.
+        use_region_fluents: If True, alpha_ik/beta_ik are per-(robot, fixed-obj) numeric fluents
+            (see create_mm_drrt_domain's docstring) instead of domain-wide constants, and are set
+            per (robot, fixed-obj) pair from `region_offsets` below (falling back to the
+            transit_/transfer_ *_offset constants above for any pair not in it).
+        region_offsets: {(pybullet_robot, pybullet_fixed_obj): {'transit': (alpha, beta) or None,
+            'transfer': (alpha, beta) or None}} -- real, motion-derived per-(robot, region)
+            offsets (see mm_drrt/utils/rai_motion_planner_utils.py's sample_region_offsets()),
+            keyed by the SAME pybullet object identifiers env.create_pddl_problem() returns in its
+            'robot'/'fixed-obj' lists -- one entry per action i (a specific robot's move), not
+            just per region, since two robots can approach the same region with different
+            geometry. Only consulted when use_region_fluents=True. A None value (sampling found no
+            valid grasp/IK/motion for that pair) is treated the same as a missing entry -- the
+            constant fallback above is used instead of silently leaving a region unprotected.
 
     Returns:
         (problem, mapper)
@@ -83,13 +99,17 @@ def generate_problem(env, save_to_file=False, transit_duration=10, transfer_dura
                                             transit_region_entry_offset=transit_region_entry_offset,
                                             transit_region_exit_offset=transit_region_exit_offset,
                                             transfer_region_entry_offset=transfer_region_entry_offset,
-                                            transfer_region_exit_offset=transfer_region_exit_offset)
+                                            transfer_region_exit_offset=transfer_region_exit_offset,
+                                            use_region_fluents=use_region_fluents)
     types           = domain['types']
     boolean_fluents = domain['boolean_fluents']
+    numeric_fluents = domain['numeric_fluents']
     actions         = domain['actions']
 
     for fluent in boolean_fluents:
         problem.add_fluent(fluent, default_initial_value=False)
+    for fluent, default_value in numeric_fluents:
+        problem.add_fluent(fluent, default_initial_value=default_value)
     for action in actions:
         problem.add_action(action)
 
@@ -102,6 +122,27 @@ def generate_problem(env, save_to_file=False, transit_duration=10, transfer_dura
             upf_obj   = Object(pddl_name, types[obj_type])
             problem.add_object(upf_obj)
             mapper.register(pybullet_obj, pddl_name)
+
+    # Per-region motion-derived overrides (only meaningful with use_region_fluents=True -- see
+    # this function's docstring). A region with no measurement here keeps the domain-wide
+    # constant default_initial_value already set above.
+    if region_offsets:
+        offset_fluents = domain['region_offset_fluents']
+        for (pybullet_robot, pybullet_f_obj), per_type in region_offsets.items():
+            robot_pddl_name = mapper.get_pddl_name(pybullet_robot)
+            f_obj_pddl_name = mapper.get_pddl_name(pybullet_f_obj)
+            if robot_pddl_name is None or f_obj_pddl_name is None:
+                continue
+            upf_robot = _lookup_upf_obj(robot_pddl_name, problem)
+            upf_f_obj = _lookup_upf_obj(f_obj_pddl_name, problem)
+            for action_type, fluent_keys in (('transit', ('transit_entry', 'transit_exit')),
+                                             ('transfer', ('transfer_entry', 'transfer_exit'))):
+                measured = (per_type or {}).get(action_type)
+                if measured is None:
+                    continue
+                alpha, beta = measured
+                problem.set_initial_value(offset_fluents[fluent_keys[0]](upf_robot, upf_f_obj), float(alpha))
+                problem.set_initial_value(offset_fluents[fluent_keys[1]](upf_robot, upf_f_obj), float(beta))
 
     fluent_map = {f.name: f for f in boolean_fluents}
 

@@ -14,7 +14,8 @@ from unified_planning.shortcuts import *
 
 def create_mm_drrt_domain(transit_duration=10, transfer_duration=10, region_mutex_enabled=False,
                           transit_region_entry_offset=0, transit_region_exit_offset=None,
-                          transfer_region_entry_offset=0, transfer_region_exit_offset=None):
+                          transfer_region_entry_offset=0, transfer_region_exit_offset=None,
+                          use_region_fluents=False):
     """
     Create MM-dRRT manipulation domain using UPF's domain builder.
 
@@ -31,22 +32,44 @@ def create_mm_drrt_domain(transit_duration=10, transfer_duration=10, region_mute
 
     With region_mutex_enabled=True, `occupied ?f` is claimed for the sub-interval
     [start + entry_offset, start + exit_offset] during which the action ACTUALLY occupies the
-    shared region -- i.e. alpha_ik/beta_ik in "si + beta_ik <= sj + alpha_jk, or the reverse" --
-    instead of the action's full duration. Two robots conflicting in the same region only get
-    forced apart across those sub-intervals, so the rest of their high-level actions (e.g. one
-    robot's approach overlapping another's retreat) can still run in parallel. Defaults (0,
-    duration) reproduce a full-duration mutex (claimed at start, released at end) -- both offsets
-    must be set away from their defaults for partial overlap to become possible.
+    shared region -- i.e. alpha_ik/beta_ik in the paper's Oi = {(Rk, [alpha_ik, beta_ik])},
+    "si + beta_ik <= sj + alpha_jk, or the reverse" -- instead of the action's full duration. Two
+    robots conflicting in the same region only get forced apart across those sub-intervals, so the
+    rest of their high-level actions (e.g. one robot's approach overlapping another's retreat) can
+    still run in parallel.
 
-    PDDL 2.1 durative actions only support at-start/at-end/over-all timing, not an arbitrary
-    intra-action timepoint, so a non-default offset pair is realized by splitting transit/transfer
-    into up to 3 chained sub-actions (approach / occupy / depart) linked by internal marker
-    fluents. With default offsets, no split happens and the action is named exactly 'transit' /
-    'transfer' as before (mm_drrt/utils/pddl_parser.py folds a split action's phases back into one
-    before anything downstream sees them either way).
+    Two ways to get alpha_ik/beta_ik into this domain, and PDDL 2.1's at-start/at-end/over-all
+    timing model forces BOTH to realize them the same way: splitting transit/transfer into up to 3
+    chained sub-actions (approach / occupy / depart) linked by internal marker fluents (there's no
+    PDDL 2.1 syntax for an arbitrary intra-action timepoint). mm_drrt/utils/pddl_parser.py folds a
+    split action's phases back into one before anything downstream sees them either way.
+
+    - use_region_fluents=False (default): transit_region_entry_offset/transit_region_exit_offset
+      (and the transfer_ equivalents) are plain GLOBAL constants, the same for every fixed-obj --
+      a single hand-declared (alpha, beta) pair per action type. This is the scoped approximation:
+      real regions differ in size/reach geometry, but this mode can't express that. Defaults (0,
+      duration) reproduce a full-duration mutex exactly, and the domain collapses back to a single
+      'transit'/'transfer' action with no split at all -- both offsets must move away from their
+      defaults for partial overlap to become possible.
+    - use_region_fluents=True: alpha_ik/beta_ik become PER-(ROBOT, FIXED-OBJ) numeric fluents
+      (transit-region-entry-offset(?r ?f), etc.) instead of domain-wide constants -- matching
+      Oi's indexing by action i (a specific robot doing a specific move), since two robots can
+      approach the very same region from different sides with genuinely different geometry -- see
+      mm_drrt/utils/rai_motion_planner_utils.py's sample_region_offsets() for how those per-object
+      values get measured from a real IK/motion-planned trajectory, and
+      mm_drrt/planner/pddl_problem_generator.py for where they get set as this fluent's per-object
+      initial value. transit_region_entry_offset/transit_region_exit_offset (and the transfer_
+      equivalents) become each fluent's DEFAULT value instead -- the fallback for any fixed-obj no
+      motion sample was measured for. The domain always splits into all 3 phases in this mode
+      (a specific object's measured offsets can still be degenerate -- e.g. entry_offset=0 -- which
+      Tamer accepts fine as a zero-duration phase for that grounded instance; it just can't be
+      decided statically per-domain any more since different objects can disagree).
 
     Returns:
-        dict with keys: boolean_fluents, actions, types
+        dict with keys: boolean_fluents, numeric_fluents, actions, types
+        numeric_fluents is a list of (fluent, default_value) pairs (empty unless
+        use_region_fluents=True) -- register each with
+        problem.add_fluent(fluent, default_initial_value=default_value).
     """
     if transit_region_exit_offset is None:
         transit_region_exit_offset = transit_duration
@@ -54,6 +77,8 @@ def create_mm_drrt_domain(transit_duration=10, transfer_duration=10, region_mute
         transfer_region_exit_offset = transfer_duration
 
     if not region_mutex_enabled:
+        if use_region_fluents:
+            raise ValueError("use_region_fluents=True requires region_mutex_enabled=True.")
         if (transit_region_entry_offset, transit_region_exit_offset) != (0, transit_duration) or \
            (transfer_region_entry_offset, transfer_region_exit_offset) != (0, transfer_duration):
             raise ValueError(
@@ -94,16 +119,30 @@ def create_mm_drrt_domain(transit_duration=10, transfer_duration=10, region_mute
     transfer_entered        = Fluent('transfer-entered',        BoolType(), r=Robot, m=MovableObj, f=FixedObj)
     transfer_occupied_done  = Fluent('transfer-occupied-done',  BoolType(), r=Robot, m=MovableObj, f=FixedObj)
 
+    # Per-fixed-obj alpha_ik/beta_ik -- only built/registered when use_region_fluents=True.
+    transit_entry_offset_f  = Fluent('transit-region-entry-offset',  RealType(), r=Robot, f=FixedObj)
+    transit_exit_offset_f   = Fluent('transit-region-exit-offset',   RealType(), r=Robot, f=FixedObj)
+    transfer_entry_offset_f = Fluent('transfer-region-entry-offset', RealType(), r=Robot, f=FixedObj)
+    transfer_exit_offset_f  = Fluent('transfer-region-exit-offset',  RealType(), r=Robot, f=FixedObj)
+
     boolean_fluents = [robot_at_base, robot_free, holding, obj_clear,
                        surface_accessible, robot_can_reach, obj_location]
+    numeric_fluents = []
     if region_mutex_enabled:
         boolean_fluents.append(occupied)
+    if use_region_fluents:
+        numeric_fluents = [
+            (transit_entry_offset_f, float(transit_region_entry_offset)),
+            (transit_exit_offset_f, float(transit_region_exit_offset)),
+            (transfer_entry_offset_f, float(transfer_region_entry_offset)),
+            (transfer_exit_offset_f, float(transfer_region_exit_offset)),
+        ]
 
     actions = []
 
     # ---- transit(r, m, from): pick object m from surface from -------------------------------
-    transit_has_approach = transit_region_entry_offset > 0
-    transit_has_depart   = transit_region_exit_offset < transit_duration
+    transit_has_approach = use_region_fluents or (transit_region_entry_offset > 0)
+    transit_has_depart   = use_region_fluents or (transit_region_exit_offset < transit_duration)
     transit_occupy_duration = transit_region_exit_offset - transit_region_entry_offset
 
     if not transit_has_approach and not transit_has_depart:
@@ -132,8 +171,9 @@ def create_mm_drrt_domain(transit_duration=10, transfer_duration=10, region_mute
 
         if transit_has_approach:
             approach = DurativeAction('transit-approach', r=Robot, m=MovableObj, from_f=FixedObj)
-            approach.set_fixed_duration(transit_region_entry_offset)
             r, m, from_f = approach.parameter('r'), approach.parameter('m'), approach.parameter('from_f')
+            approach.set_fixed_duration(transit_entry_offset_f(r, from_f) if use_region_fluents
+                                       else transit_region_entry_offset)
             approach.add_condition(StartTiming(), robot_free(r))
             approach.add_condition(StartTiming(), obj_location(m, from_f))
             approach.add_condition(StartTiming(), obj_clear(m))
@@ -146,8 +186,9 @@ def create_mm_drrt_domain(transit_duration=10, transfer_duration=10, region_mute
             actions.append(approach)
 
         occupy = DurativeAction('transit-occupy', r=Robot, m=MovableObj, from_f=FixedObj)
-        occupy.set_fixed_duration(transit_occupy_duration)
         r, m, from_f = occupy.parameter('r'), occupy.parameter('m'), occupy.parameter('from_f')
+        occupy.set_fixed_duration(Minus(transit_exit_offset_f(r, from_f), transit_entry_offset_f(r, from_f))
+                                 if use_region_fluents else transit_occupy_duration)
         if transit_has_approach:
             occupy.add_condition(StartTiming(), transit_entered(r, m, from_f))
             occupy.add_effect(StartTiming(), transit_entered(r, m, from_f), False)
@@ -171,8 +212,9 @@ def create_mm_drrt_domain(transit_duration=10, transfer_duration=10, region_mute
 
         if transit_has_depart:
             depart = DurativeAction('transit-depart', r=Robot, m=MovableObj, from_f=FixedObj)
-            depart.set_fixed_duration(transit_duration - transit_region_exit_offset)
             r, m, from_f = depart.parameter('r'), depart.parameter('m'), depart.parameter('from_f')
+            depart.set_fixed_duration(Minus(transit_duration, transit_exit_offset_f(r, from_f))
+                                     if use_region_fluents else transit_duration - transit_region_exit_offset)
             depart.add_condition(StartTiming(), transit_occupied_done(r, m, from_f))
             depart.add_condition(ClosedTimeInterval(StartTiming(), EndTiming()), surface_accessible(from_f))
             depart.add_condition(ClosedTimeInterval(StartTiming(), EndTiming()), robot_can_reach(r, from_f))
@@ -181,8 +223,8 @@ def create_mm_drrt_domain(transit_duration=10, transfer_duration=10, region_mute
             actions.append(depart)
 
     # ---- transfer(r, m, to): place object m on surface to -----------------------------------
-    transfer_has_approach = transfer_region_entry_offset > 0
-    transfer_has_depart   = transfer_region_exit_offset < transfer_duration
+    transfer_has_approach = use_region_fluents or (transfer_region_entry_offset > 0)
+    transfer_has_depart   = use_region_fluents or (transfer_region_exit_offset < transfer_duration)
     transfer_occupy_duration = transfer_region_exit_offset - transfer_region_entry_offset
 
     if not transfer_has_approach and not transfer_has_depart:
@@ -209,8 +251,9 @@ def create_mm_drrt_domain(transit_duration=10, transfer_duration=10, region_mute
 
         if transfer_has_approach:
             approach = DurativeAction('transfer-approach', r=Robot, m=MovableObj, to_f=FixedObj)
-            approach.set_fixed_duration(transfer_region_entry_offset)
             r, m, to_f = approach.parameter('r'), approach.parameter('m'), approach.parameter('to_f')
+            approach.set_fixed_duration(transfer_entry_offset_f(r, to_f) if use_region_fluents
+                                       else transfer_region_entry_offset)
             approach.add_condition(StartTiming(), holding(r, m))
             approach.add_condition(ClosedTimeInterval(StartTiming(), EndTiming()), surface_accessible(to_f))
             approach.add_condition(ClosedTimeInterval(StartTiming(), EndTiming()), robot_can_reach(r, to_f))
@@ -218,8 +261,9 @@ def create_mm_drrt_domain(transit_duration=10, transfer_duration=10, region_mute
             actions.append(approach)
 
         occupy = DurativeAction('transfer-occupy', r=Robot, m=MovableObj, to_f=FixedObj)
-        occupy.set_fixed_duration(transfer_occupy_duration)
         r, m, to_f = occupy.parameter('r'), occupy.parameter('m'), occupy.parameter('to_f')
+        occupy.set_fixed_duration(Minus(transfer_exit_offset_f(r, to_f), transfer_entry_offset_f(r, to_f))
+                                 if use_region_fluents else transfer_occupy_duration)
         if transfer_has_approach:
             occupy.add_condition(StartTiming(), transfer_entered(r, m, to_f))
             occupy.add_effect(StartTiming(), transfer_entered(r, m, to_f), False)
@@ -241,8 +285,9 @@ def create_mm_drrt_domain(transit_duration=10, transfer_duration=10, region_mute
 
         if transfer_has_depart:
             depart = DurativeAction('transfer-depart', r=Robot, m=MovableObj, to_f=FixedObj)
-            depart.set_fixed_duration(transfer_duration - transfer_region_exit_offset)
             r, m, to_f = depart.parameter('r'), depart.parameter('m'), depart.parameter('to_f')
+            depart.set_fixed_duration(Minus(transfer_duration, transfer_exit_offset_f(r, to_f))
+                                     if use_region_fluents else transfer_duration - transfer_region_exit_offset)
             depart.add_condition(StartTiming(), transfer_occupied_done(r, m, to_f))
             depart.add_condition(ClosedTimeInterval(StartTiming(), EndTiming()), surface_accessible(to_f))
             depart.add_condition(ClosedTimeInterval(StartTiming(), EndTiming()), robot_can_reach(r, to_f))
@@ -255,8 +300,13 @@ def create_mm_drrt_domain(transit_duration=10, transfer_duration=10, region_mute
 
     return {
         'boolean_fluents': boolean_fluents,
+        'numeric_fluents': numeric_fluents,
         'actions': actions,
-        'types': {'robot': Robot, 'movable-obj': MovableObj, 'fixed-obj': FixedObj}
+        'types': {'robot': Robot, 'movable-obj': MovableObj, 'fixed-obj': FixedObj},
+        'region_offset_fluents': {
+            'transit_entry': transit_entry_offset_f, 'transit_exit': transit_exit_offset_f,
+            'transfer_entry': transfer_entry_offset_f, 'transfer_exit': transfer_exit_offset_f,
+        },
     }
 
 

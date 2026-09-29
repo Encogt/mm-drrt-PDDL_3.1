@@ -768,7 +768,11 @@ def is_placement(C, obj_frame_name, surface_frame_name, epsilon=0.02):
     return within_xy and abs(obj_bottom_z - surface_top_z) <= epsilon
 
 
-def sample_placement(C, obj_frame_name, surface_frame_name, margin=0.02):
+def sample_placement(C, obj_frame_name, surface_frame_name, margin=0.02, x_bias=0.0, y_bias=0.0):
+    """x_bias/y_bias (default 0.0, unbiased -- existing callers are unaffected) shift the sampled
+    point's center before clamping it back within the surface's valid margin, so a bias larger
+    than the available half-extent just piles samples up near that edge instead of ever landing
+    outside the surface."""
     C = _config_of(C)
     surface = C.getFrame(surface_frame_name)
     surf_pos = np.asarray(surface.getPosition())
@@ -779,8 +783,8 @@ def sample_placement(C, obj_frame_name, surface_frame_name, margin=0.02):
     half_y = max(surf_size[1] / 2.0 - obj_size[1] / 2.0 - margin, 0.0)
     if half_x <= 0 or half_y <= 0:
         return None
-    x = surf_pos[0] + random.uniform(-half_x, half_x)
-    y = surf_pos[1] + random.uniform(-half_y, half_y)
+    x = np.clip(x_bias + random.uniform(-half_x, half_x), -half_x, half_x) + surf_pos[0]
+    y = np.clip(y_bias + random.uniform(-half_y, half_y), -half_y, half_y) + surf_pos[1]
     z = surf_pos[2] + surf_size[2] / 2.0 + obj_size[2] / 2.0
     return ((x, y, z), (1.0, 0.0, 0.0, 0.0))
 

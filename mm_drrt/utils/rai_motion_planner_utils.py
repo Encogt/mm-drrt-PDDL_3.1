@@ -16,6 +16,8 @@ from mm_drrt.utils import rai_utils as ru
 from mm_drrt.planner.prm import DegreePRM
 from mm_drrt.planner.prm import prm
 from mm_drrt.utils.motion_planner_utils import get_max_length_list
+from mm_drrt.utils.coordination_regions import region_volume_from_frame, point_in_region, \
+    DEFAULT_HEIGHT_MARGIN
 
 GRASP_LENGTH = 0.03
 APPROACH_DISTANCE = 0.1 + GRASP_LENGTH
@@ -723,3 +725,118 @@ def get_inter_robots_collision_fn(robots, joints, num_robots=1, tolerance=None, 
                     collision_robot_index.extend(pair)
             return list(np.unique(collision_robot_index))
     return drrt_collision_fn
+
+
+##### Motion-derived region entry/exit offsets #####
+# What computes alpha_ik/beta_ik ("Oi = {(Rk, [alpha_ik, beta_ik])}") from a REAL, IK/motion-
+# planned trajectory instead of a hand-picked CLI constant -- see
+# mm_drrt/planner/pddl_domain.py's docstring for how these offsets are used once derived, and its
+# module-level note on why they're a representative sample, not a live per-plan value.
+
+def _extract_roadmap_path(roadmap):
+    """A roadmap (DegreePRM, mm_drrt/planner/prm.py) records the (start, goal) it was solved for
+    as .initial_conf/.final_conf -- calling it again with those retraces the concrete waypoint
+    path, same as naive_duration_executor.py's _extract_path and get_arm_motion_fn's own internal
+    use of the mechanism."""
+    path = roadmap(roadmap.initial_conf, roadmap.final_conf)
+    return path if path else [roadmap.final_conf]
+
+
+def gripper_positions_along_path(robot, arm_joints, gripper_frame, path):
+    """FK: the gripper frame's world position at each waypoint of an arm-joint-space path. path
+    entries may carry extra leading values (get_arm_motion_fn's expand_configs prefix) -- only the
+    last len(arm_joints) values are ever the arm's own joint state, matching how
+    _path_clips_object already slices waypoints elsewhere in this file."""
+    C = ru._config_of(robot)
+    positions = []
+    for q in path:
+        ru.set_joint_positions(robot, arm_joints, q[-len(arm_joints):])
+        positions.append(tuple(C.getFrame(gripper_frame).getPosition()))
+    return positions
+
+
+def trajectory_region_fractions(robot, arm_joints, gripper_frame, path, region):
+    """(entry_fraction, exit_fraction) in [0, 1] of `path`'s length during which the gripper is
+    inside `region` (a coordination_regions.RegionVolume), or None if it never is. Fractions, not
+    raw indices/times, since the caller scales them against the action's own declared duration."""
+    positions = gripper_positions_along_path(robot, arm_joints, gripper_frame, path)
+    inside = [i for i, p in enumerate(positions) if point_in_region(p, region)]
+    if not inside:
+        return None
+    n = len(positions) - 1 if len(positions) > 1 else 1
+    return inside[0] / n, inside[-1] / n
+
+
+def sample_region_offsets(robot, arm, grasp_type, m_obj, region_frame, action_type, duration,
+                          height_margin=DEFAULT_HEIGHT_MARGIN, num_arm_samples=100,
+                          collision_objs=(), max_grasp_attempts=5, arm_joints=None,
+                          gripper_frame=None, use_debug=False):
+    """Samples ONE representative arm trajectory into/out of region_frame -- 'transit' picks m_obj
+    up FROM a pose sampled in region_frame, 'transfer' places it ONTO one -- and measures, via
+    trajectory_region_fractions, the fraction of that trajectory during which the gripper is
+    actually inside the region's coordination_regions.region_volume_from_frame(). Returns
+    (alpha, beta) scaled to `duration` (the action's declared nominal duration), or None if no
+    valid grasp/IK/motion sample was found (the caller should then fall back to treating the whole
+    action as conflicting with the region, i.e. alpha=0, beta=duration).
+
+    Reuses the SAME low-level IK/motion primitives (get_grasp_gen, get_placement_gen,
+    get_fixed_arm_pick_place_ik_gen, get_arm_motion_fn, arm_retrieval_motion) the real per-plan
+    path computation (mm_drrt/utils/rai_task_planner_utils.py's individual_path_computation, via
+    env.compute_path) drives -- just without that machinery's plan-specific Action/subgoal
+    bookkeeping, since this has to run BEFORE Tamer has produced a plan to refine. It therefore
+    measures a representative sample (any valid grasp/placement for m_obj at region_frame), not
+    the specific trajectory the eventual plan will execute.
+    """
+    C = ru._config_of(robot)
+    arm_joints, gripper_frame, _, carry_conf = ru._spec_of(robot, arm_joints, gripper_frame)
+    region = region_volume_from_frame(C, region_frame, height_margin=height_margin)
+    collision_objs = list(collision_objs)
+
+    place_gen = get_placement_gen(robot)(m_obj, region_frame)
+    pose = next(place_gen, None)
+    if pose is None:
+        return None
+    (pose,) = pose
+
+    grasps = get_grasp_gen(grasp_type)(robot, m_obj)
+    pick_place_fn = get_fixed_arm_pick_place_ik_gen(
+        robot, max_attempts=1, use_debug=use_debug, arm_joints=arm_joints,
+        start_collision_objs=collision_objs, goal_collision_objs=collision_objs)
+    arm_motion_fn = get_arm_motion_fn(robot, collision_objs=collision_objs,
+                                      num_samples=num_arm_samples, arm_joints=arm_joints,
+                                      expand_type=None, expand_configs=(), use_debug=use_debug)
+
+    for (grasp,) in grasps[:max_grasp_attempts]:
+        ik_result = next(pick_place_fn(arm, m_obj, pose, grasp, pose), None)
+        if ik_result is None:
+            continue
+        (_, approach_conf, grasp_conf), _ = ik_result
+
+        pose.assign()
+        attachments = [m_obj] if action_type == 'transfer' else []
+        approach_roadmap, _ = arm_motion_fn(arm, m_obj, grasp, approach_conf, grasp_conf,
+                                            attachments=attachments)
+        if approach_roadmap is None:
+            continue
+
+        if action_type == 'transit':
+            grasp.attach(C, gripper_frame=gripper_frame)
+        retrieval_attachments = [m_obj] if action_type == 'transit' else []
+        retrieval_roadmap, _ = arm_retrieval_motion(
+            robot, arm, action_type, grasp=grasp, start=approach_roadmap.final_conf,
+            goal=carry_conf, obstacles=collision_objs, attachments=retrieval_attachments,
+            num_samples=num_arm_samples, expand_type=None, expand_configs=(),
+            arm_joints=arm_joints, use_debug=use_debug)
+        if action_type == 'transit':
+            grasp.detach(C, region_frame)
+        if retrieval_roadmap is None:
+            continue
+
+        full_path = _extract_roadmap_path(approach_roadmap) + _extract_roadmap_path(retrieval_roadmap)
+        fractions = trajectory_region_fractions(robot, arm_joints, gripper_frame, full_path, region)
+        if fractions is None:
+            continue
+        alpha_frac, beta_frac = fractions
+        return alpha_frac * duration, beta_frac * duration
+
+    return None

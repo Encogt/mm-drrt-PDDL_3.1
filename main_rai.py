@@ -1,5 +1,6 @@
 import argparse
 import random
+import time
 import numpy as np
 
 from mm_drrt.utils.rai_utils import connect, disconnect, set_camera_pose, refresh_view
@@ -12,6 +13,8 @@ from examples.envs.stack_blocks_rai_env import StackBlocksRaiEnvironment, \
     StackBlocksRaiCameraSetup
 from examples.envs.duration_conflict_rai_env import DurationConflictRaiEnvironment, \
     DurationConflictRaiCameraSetup
+from examples.envs.region_coordination_demo_rai_env import RegionCoordinationDemoRaiEnvironment, \
+    RegionCoordinationDemoCameraSetup
 from mm_drrt.planner.rai_task_planner import PlanSkeleton
 from mm_drrt.utils.rai_motion_planner_utils import replay_composite_path
 from experiments.data_saver import data_saver
@@ -48,6 +51,14 @@ parser.add_argument('--transit_region_entry_offset', type=float, default=0, help
 parser.add_argument('--transit_region_exit_offset', type=float, default=None, help='Seconds into a transit action when it stops occupying its shared region (beta for transit); defaults to --transit_duration')
 parser.add_argument('--transfer_region_entry_offset', type=float, default=0, help='Seconds into a transfer action before it starts occupying its shared region (alpha for transfer)')
 parser.add_argument('--transfer_region_exit_offset', type=float, default=None, help='Seconds into a transfer action when it stops occupying its shared region (beta for transfer); defaults to --transfer_duration')
+# Motion-derived offsets: replaces the --*_region_*_offset CLI constants above with real
+# alpha_ik/beta_ik measured from an actual IK/motion-planned trajectory (env.measure_region_offsets(),
+# e.g. examples/envs/duration_conflict_rai_env.py's -- only environments that implement it support
+# this flag). See that method's docstring for the asymmetric reduction it applies (only entry_offset
+# for transit, only exit_offset for transfer) and why: Tamer's search does not scale to narrowing
+# both sides of both action types at once at this environment's size -- confirmed empirically, not
+# a domain soundness issue. See docs/minimal_temporal_constraints.md.
+parser.add_argument('--region_offsets_from_motion', action='store_true', help='Replace the --*_region_*_offset constants with values measured from a real motion-planned trajectory (requires --region_mutex_enabled and an environment implementing measure_region_offsets())')
 # Load a HAND-EDITED PDDL domain/problem file pair (mm_drrt/planner/pddl_file_planner.py) and
 # run whatever Tamer solves from it in this RAI env, instead of the normal
 # create_pddl_problem()-generated-in-memory path. No fallback to another planner on
@@ -82,10 +93,36 @@ elif opt.env_type == 'exp_duration_conflict_rai':
     set_camera_pose(C, camera_point=DurationConflictRaiCameraSetup[0], target_point=DurationConflictRaiCameraSetup[1])
     env = DurationConflictRaiEnvironment(num_robots=opt.num_robots, num_objs=opt.num_objs, arm=opt.arm,
                                          grasp_type=opt.grasp_type, sim_id=C, seed=opt.seed)
+elif opt.env_type == 'exp_region_coordination_demo':
+    set_camera_pose(C, camera_point=RegionCoordinationDemoCameraSetup[0], target_point=RegionCoordinationDemoCameraSetup[1])
+    env = RegionCoordinationDemoRaiEnvironment(num_robots=opt.num_robots, num_objs=opt.num_objs, arm=opt.arm,
+                                               grasp_type=opt.grasp_type, sim_id=C, seed=opt.seed)
 else:
     raise ValueError('Unsupported env_type for the RAI POC: {}'.format(opt.env_type))
 
 refresh_view(C, use_gui=opt.use_gui)
+
+if opt.region_offsets_from_motion:
+    if not opt.region_mutex_enabled:
+        raise ValueError('--region_offsets_from_motion requires --region_mutex_enabled')
+    if not hasattr(env, 'measure_region_offsets'):
+        raise ValueError(f'{type(env).__name__} does not implement measure_region_offsets() -- '
+                         f'--region_offsets_from_motion is not supported for --env_type {opt.env_type}')
+    print("Measuring region entry/exit offsets from real IK/motion-planned trajectories...")
+    measured = env.measure_region_offsets()
+    print(f"  transit  alpha/beta = {measured['transit']}")
+    print(f"  transfer alpha/beta = {measured['transfer']}")
+    opt.transit_region_entry_offset = measured['transit'][0]
+    opt.transfer_region_exit_offset = measured['transfer'][1]
+    # measure_region_offsets() draws random numbers (grasp shuffling, placement sampling) from the
+    # same global random state everything else below uses -- without re-seeding, that shifts which
+    # grasp/placement Steps 1-3 later draw purely as a side effect of THIS flag being on, making a
+    # --region_offsets_from_motion run's chosen arm path differ from a plain run's even though path
+    # computation itself (Steps 1-3) is completely unaffected by this feature. Re-seeding puts
+    # everything after this point back on the exact same random draws either way, so the only real
+    # difference between the two runs is the schedule this flag produces, not incidental path noise.
+    random.seed(opt.seed)
+    np.random.seed(opt.seed)
 
 if opt.naive_playback:
     if opt.env_type != 'exp_duration_conflict_rai':
@@ -166,7 +203,11 @@ print(f"Planner used: {planner_used}")
 
 assert opt.num_robots == len(action_orders), "Error: num_robots is not properly set"
 ps = PlanSkeleton(env, plan, obj_orders, init_order_constraints, opt.num_placement_samples, opt.use_debug)
+refinement_start = time.time()
 composite_path = ps.plan_refinement(opt.num_base_samples, opt.num_arm_samples, opt.drrt_num_iters, opt.drrt_time_limit)
+refinement_elapsed = time.time() - refinement_start
+print(f"Plan refinement (Steps 1-4) took {refinement_elapsed:.2f}s wall-clock; "
+     f"composite path has {len(composite_path)} waypoints")
 data_saver(composite_path, opt)
 
 if opt.use_gui:
@@ -188,6 +229,14 @@ if opt.use_gui:
     gripper_frames = [getattr(getattr(r, 'spec', None), 'gripper_frame', None) for r in robots]
     if all(g is None for g in gripper_frames):
         gripper_frames = None  # single-mobile-robot scenario: replay_composite_path's own default
+    replay_start = time.time()
     replay_composite_path(C, composite_path, joints, release_targets, gripper_frames=gripper_frames)
+    replay_elapsed = time.time() - replay_start
+    # This is the number that should actually shift between --region_mutex_enabled runs and a
+    # stock run: more overlap in the solved plan means fewer total composite-path waypoints to
+    # step through, so a shorter playback here -- unlike the arms' own paths (Steps 1-3), which
+    # this feature never touches (see main_rai.py's --region_offsets_from_motion reseed comment).
+    print(f"Simulation playback took {replay_elapsed:.2f}s wall-clock "
+         f"({len(composite_path)} composite waypoints)")
     input("Simulation complete. Press Enter to close...")
 disconnect(C)
