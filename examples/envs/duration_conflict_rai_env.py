@@ -311,6 +311,82 @@ class DurationConflictRaiEnvironment(Environment):
                 if measured else (0.0, duration)
         return offsets
 
+    def measure_executed_region_offsets(self, composite_path, duration=10.0):
+        """The EXECUTED-path counterpart to measure_region_offsets(): measures each robot's REAL,
+        dRRT*-refined trajectory -- not a representative pre-planning sample -- against the same
+        regions, in the same collapsed {'transit': (alpha, beta), 'transfer': (alpha, beta)}
+        shape, for direct comparison via mm_drrt/utils/temporal_repair.py's
+        repair_region_offsets().
+
+        Splitting one robot's full composite-path trajectory into its transit (pick) and transfer
+        (place) segments: concatenate node.sub_local_paths[r] across every node in composite_path
+        to get that robot's full joint-space path, find the grasp event (the first node where
+        node.attachments[r] becomes non-None -- per replay_composite_path's own docstring, that's
+        the LAST waypoint of that node's segment), then scan forward from there for the first
+        waypoint whose joint config exactly matches the robot's own carry_conf.
+        arm_retrieval_motion's goal is always carry_conf (mm_drrt/utils/rai_motion_planner_utils.py)
+        for BOTH transit's retrieval and transfer's approach start, so this lands on an EXACT
+        (confirmed via direct instrumentation: zero floating-point distance, not an approximate
+        threshold) boundary between "transit's retrieval has ended" and "transfer's approach is
+        about to begin" -- without needing to parse dRRT*'s own node.subprob_id bookkeeping at all.
+
+        A robot that never grasped anything in this composite_path (attachments[r] stays None
+        throughout), or where the carry_conf boundary is never found, is silently skipped for that
+        robot -- this is a best-effort real-path measurement, not a required one; the caller
+        should treat a missing action type here (None in the returned dict) as "nothing to repair
+        against this run," not an error.
+
+        Returns {'transit': (alpha, beta) or None, 'transfer': (alpha, beta) or None}.
+        """
+        from mm_drrt.utils.rai_motion_planner_utils import trajectory_region_fractions
+        from mm_drrt.utils.coordination_regions import region_volume_from_frame
+        import numpy as np
+
+        samples = {'transit': [], 'transfer': []}
+        for r, zone in ((0, self.f_objs[0]), (1, self.f_objs[1])):
+            robot = self.robots[r]
+            arm_joints, gripper_frame, _, carry_conf = ru._spec_of(robot)
+            carry = np.asarray(carry_conf)
+
+            full_path, grasp_idx = [], None
+            for node in composite_path:
+                path_r = node.sub_local_paths[r] if node.sub_local_paths else []
+                full_path.extend(path_r)
+                if node.attachments and node.attachments[r] and grasp_idx is None:
+                    grasp_idx = len(full_path) - 1
+            if grasp_idx is None:
+                continue
+
+            split_idx = None
+            for i in range(grasp_idx, len(full_path)):
+                q = np.asarray(full_path[i][-len(arm_joints):])
+                if np.linalg.norm(q - carry) < 1e-6:
+                    split_idx = i
+                    break
+            if split_idx is None:
+                continue
+
+            transit_path = full_path[:split_idx + 1]
+            transfer_path = full_path[split_idx:]
+            transit_region = region_volume_from_frame(self._C, zone)
+            transfer_region = region_volume_from_frame(self._C, 'drop_pad')
+
+            transit_fracs = trajectory_region_fractions(robot, arm_joints, gripper_frame,
+                                                         transit_path, transit_region)
+            transfer_fracs = trajectory_region_fractions(robot, arm_joints, gripper_frame,
+                                                          transfer_path, transfer_region)
+            if transit_fracs is not None:
+                samples['transit'].append((transit_fracs[0] * duration, transit_fracs[1] * duration))
+            if transfer_fracs is not None:
+                samples['transfer'].append((transfer_fracs[0] * duration, transfer_fracs[1] * duration))
+
+        offsets = {}
+        for action_type in ('transit', 'transfer'):
+            measured = samples[action_type]
+            offsets[action_type] = (min(a for a, b in measured), max(b for a, b in measured)) \
+                if measured else None
+        return offsets
+
     def _assign_target_obj_pose(self, actions, obj_orders, m_obj, action):
         for a in actions:
             if actions[a] == action:

@@ -17,6 +17,8 @@ from examples.envs.region_coordination_demo_rai_env import RegionCoordinationDem
     RegionCoordinationDemoCameraSetup
 from mm_drrt.planner.rai_task_planner import PlanSkeleton
 from mm_drrt.utils.rai_motion_planner_utils import replay_composite_path
+from mm_drrt.utils.temporal_repair import repair_region_offsets, DEFAULT_TOLERANCE
+from mm_drrt.utils.region_offsets_cache import load_cached_offsets, save_cached_offsets
 from experiments.data_saver import data_saver
 
 parser = argparse.ArgumentParser()
@@ -112,8 +114,24 @@ if opt.region_offsets_from_motion:
     measured = env.measure_region_offsets()
     print(f"  transit  alpha/beta = {measured['transit']}")
     print(f"  transfer alpha/beta = {measured['transfer']}")
+
+    # A past run's repair_region_offsets() widening (below, after plan_refinement()) has nowhere
+    # to land if nothing ever reads it back -- merge any cached prior widening in now (union, same
+    # "only ever widen" rule repair_region_offsets() itself uses) so a past violation's correction
+    # actually carries forward instead of being silently re-measured away on the next run.
+    cached = load_cached_offsets(type(env).__name__)
+    if cached:
+        print(f"  cached from a prior run: {cached}")
+        for action_type in ('transit', 'transfer'):
+            if action_type in cached:
+                ca, cb = cached[action_type]
+                ma, mb = measured[action_type]
+                measured[action_type] = (min(ca, ma), max(cb, mb))
+        print(f"  merged -> transit={measured['transit']}  transfer={measured['transfer']}")
+
     opt.transit_region_entry_offset = measured['transit'][0]
     opt.transfer_region_exit_offset = measured['transfer'][1]
+    planned_region_offsets = measured  # kept for the repair comparison after plan_refinement()
     # measure_region_offsets() draws random numbers (grasp shuffling, placement sampling) from the
     # same global random state everything else below uses -- without re-seeding, that shifts which
     # grasp/placement Steps 1-3 later draw purely as a side effect of THIS flag being on, making a
@@ -209,6 +227,57 @@ refinement_elapsed = time.time() - refinement_start
 print(f"Plan refinement (Steps 1-4) took {refinement_elapsed:.2f}s wall-clock; "
      f"composite path has {len(composite_path)} waypoints")
 data_saver(composite_path, opt)
+
+# Temporal repair (docs/minimal_temporal_constraints.md's "Future work"): compare what each
+# region's mutex window was PLANNED with against what the REAL, dRRT*-refined composite path
+# actually measured for that same run, via mm_drrt/utils/temporal_repair.py.
+if opt.region_offsets_from_motion:
+    if not hasattr(env, 'measure_executed_region_offsets'):
+        print(f"Note: {type(env).__name__} does not implement measure_executed_region_offsets() "
+             f"-- skipping temporal repair check for this run.")
+    else:
+        print("Measuring ACTUAL region entry/exit offsets from the executed composite path...")
+        executed = env.measure_executed_region_offsets(composite_path)
+        repaired = {}
+        any_violation = False
+        for action_type in ('transit', 'transfer'):
+            planned = planned_region_offsets.get(action_type)
+            measured_exec = executed.get(action_type)
+            if planned is None or measured_exec is None:
+                print(f"  {action_type}: nothing to repair against this run "
+                     f"(no {'planned' if planned is None else 'executed'} measurement)")
+                continue
+            pa, pb = planned
+            ma, mb = measured_exec
+            result = repair_region_offsets(pa, pb, ma, mb)
+            repaired[action_type] = (result.updated_alpha, result.updated_beta)
+            status = "VIOLATED" if result.violated else "ok"
+            print(f"  {action_type}: planned=({pa:.3f},{pb:.3f}) measured=({ma:.3f},{mb:.3f}) "
+                 f"-> {status}  (entry_diff={result.entry_diff:+.3f}, exit_diff={result.exit_diff:+.3f})")
+            if result.violated:
+                any_violation = True
+                # Decision: print loudly, don't fail/abort the run. dRRT*'s own
+                # inter_robots_collision_fn (rai_drrt_star.py) already independently verified THIS
+                # run's composite path is collision-free, regardless of what the PDDL-level mutex
+                # window assumed -- same "about matching the solver's chosen concurrency, not about
+                # safety" property mm_drrt/utils/pddl_parser.py's extract_shared_surface_constraints
+                # already documents for its own ordering constraints. A violation here means the
+                # offsets THIS run's schedule was planned around under-covered the real geometry --
+                # a data-quality problem for the NEXT plan built from them, not evidence this run
+                # was unsafe. Failing/asserting would abort an already-verified-safe run over a
+                # background bookkeeping estimate; widening + persisting (below) is what actually
+                # addresses it going forward.
+                print(f"  ⚠ TEMPORAL REPAIR VIOLATION in {action_type}: the planned mutex "
+                     f"window did not cover this run's real measured occupancy by more than "
+                     f"the {DEFAULT_TOLERANCE}s tolerance. This run's safety was still "
+                     f"independently guaranteed by dRRT*'s own collision checking; this is a "
+                     f"signal to correct future planning, not that this run collided.")
+        if repaired:
+            cache_path = save_cached_offsets(type(env).__name__, repaired)
+            print(f"  Saved widened offsets to {cache_path} for future runs.")
+        if any_violation:
+            print("WARNING: at least one region's temporal repair check was VIOLATED this run "
+                 "(see above) -- the stored offsets have been widened to correct for it.")
 
 if opt.use_gui:
     robots = list(env.robots.values())
