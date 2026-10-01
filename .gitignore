@@ -6,6 +6,7 @@ data_mm*
 */__pycache__/
 */*/__pycache__/
 experiments/run_*
+experiments/region_offsets_cache.json
 test_multirobot_t2
 *.mp4
 __pycache__/
