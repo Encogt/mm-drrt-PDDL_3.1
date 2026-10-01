@@ -39,3 +39,25 @@ def region_volume_from_frame(C, frame_name, height_margin=DEFAULT_HEIGHT_MARGIN)
 
 def point_in_region(point, region):
     return all(abs(point[i] - region.center[i]) <= region.half_extents[i] for i in range(3))
+
+
+# Real, hand-authored coordinates for the regions region_volume_from_g_file() below can load --
+# matches examples/envs/duration_conflict_rai_env.py's ZONE_X/PAD_X/SURFACE_Y/SURFACE_Z/ZONE_SIZE/
+# PAD_SIZE exactly (see that file for why these particular numbers). Not the default path --
+# region_volume_from_frame() against a real environment's live Config always matches whatever
+# that environment actually built, this doesn't -- but a legitimate alternative when a region's
+# volume is needed without constructing/connecting to a real environment at all.
+DEFAULT_G_FILE = __file__.rsplit('.py', 1)[0] + '.g'
+
+
+def region_volume_from_g_file(frame_name, g_file=DEFAULT_G_FILE, height_margin=DEFAULT_HEIGHT_MARGIN):
+    """Alternative to region_volume_from_frame() for when no live environment Config is
+    available/wanted: loads frame_name's definition from a standalone .g scene file (default:
+    coordination_regions.g, next to this module) into a throwaway ry.Config, then reads it the
+    exact same way region_volume_from_frame() does -- so that function stays the single source of
+    truth for how a bounding volume is derived from a frame; only WHERE the frame comes from
+    differs here."""
+    import robotic as ry
+    C = ry.Config()
+    C.addFile(g_file)
+    return region_volume_from_frame(C, frame_name, height_margin=height_margin)
