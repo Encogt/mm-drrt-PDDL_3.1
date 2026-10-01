@@ -267,7 +267,7 @@ if opt.region_offsets_from_motion:
                 # was unsafe. Failing/asserting would abort an already-verified-safe run over a
                 # background bookkeeping estimate; widening + persisting (below) is what actually
                 # addresses it going forward.
-                print(f"  ⚠ TEMPORAL REPAIR VIOLATION in {action_type}: the planned mutex "
+                print(f"  TEMPORAL REPAIR VIOLATION in {action_type}: the planned mutex "
                      f"window did not cover this run's real measured occupancy by more than "
                      f"the {DEFAULT_TOLERANCE}s tolerance. This run's safety was still "
                      f"independently guaranteed by dRRT*'s own collision checking; this is a "

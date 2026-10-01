@@ -49,6 +49,9 @@ _copy_counter = itertools.count()
 # Same pad convention as the other RAI envs: thin, non-collidable marker frames on top of the
 # real, contact-enabled 'table' frame (pandasTable.g) -- the table itself is the only real
 # collision geometry for the tabletop.
+#
+# ZONE_SIZE/PAD_SIZE/ZONE_X/PAD_X/SURFACE_Y/SURFACE_Z below are also mirrored in
+# mm_drrt/utils/coordination_regions.g -- update both.
 ZONE_SIZE = (0.3, 0.3, 0.02)
 # Deliberately small (vs. the 0.3x0.3 zones): sample_placement()'s jitter margin (rai_utils.py)
 # only leaves ~3.5cm of room per block on this footprint, so the two independently-sampled
