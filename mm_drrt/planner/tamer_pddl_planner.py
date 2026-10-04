@@ -8,6 +8,9 @@ classical Fast Downward planning (mm_drrt.planner.pddl_planner.PDDLPlanner)
 if it fails.
 """
 
+import multiprocessing as mp
+from types import SimpleNamespace
+
 import unified_planning as up
 from unified_planning.shortcuts import OneshotPlanner
 from unified_planning.engines import PlanGenerationResultStatus
@@ -47,6 +50,58 @@ class TamerParseError(TamerPlannerError):
     pass
 
 
+def _solve_in_child(problem, conn):
+    """Child-process body for _solve_with_wall_clock_timeout: sends back only plain data (status
+    name + (start, action name, parameter names, duration) tuples) -- UPF plan objects hold
+    references to the problem and aren't reliably picklable across processes."""
+    try:
+        with OneshotPlanner(name='tamer') as planner:
+            result = planner.solve(problem)
+        timed = None
+        if result.status in SOLVED_STATUSES:
+            timed = [(start, a.action.name, [str(p) for p in a.actual_parameters], duration)
+                     for start, a, duration in result.plan.timed_actions]
+        conn.send(('ok', result.status.name, timed))
+    except Exception as e:
+        conn.send(('error', f"{type(e).__name__}: {e}", None))
+    finally:
+        conn.close()
+
+
+def _solve_with_wall_clock_timeout(problem, timeout):
+    """Tamer ignores OneshotPlanner.solve()'s timeout (UserWarning: 'Tamer does not support
+    timeout') and can search indefinitely -- e.g. with all four region offsets narrowed on
+    DurationConflictRaiEnvironment, it did not return within 300s. So the solve runs in a forked
+    child that is killed on expiry. Returns (status, plan) where plan mimics a TimeTriggeredPlan's
+    `timed_actions` closely enough for parse_pddl_plan (action.action.name, actual_parameters)."""
+    ctx = mp.get_context('fork')
+    parent_conn, child_conn = ctx.Pipe(duplex=False)
+    proc = ctx.Process(target=_solve_in_child, args=(problem, child_conn), daemon=True)
+    proc.start()
+    child_conn.close()
+    try:
+        if not parent_conn.poll(timeout):
+            raise TamerTimeoutError(f"Planning exceeded wall-clock timeout of {timeout}s")
+        kind, status_name, timed = parent_conn.recv()
+    except EOFError:
+        raise TamerPlannerError("Tamer child process exited without a result")
+    finally:
+        if proc.is_alive():
+            proc.kill()
+        proc.join()
+        parent_conn.close()
+
+    if kind == 'error':
+        raise TamerPlannerError(f"Planning failed: {status_name}")
+    status = PlanGenerationResultStatus[status_name]
+    plan = None
+    if timed is not None:
+        plan = SimpleNamespace(timed_actions=[
+            (start, SimpleNamespace(action=SimpleNamespace(name=name), actual_parameters=params), duration)
+            for start, name, params, duration in timed])
+    return status, plan
+
+
 class TamerPDDLPlanner:
     """
     Tamer-based PDDL 2.1 planner orchestrator for MM-dRRT.
@@ -70,6 +125,9 @@ class TamerPDDLPlanner:
         self.transit_region_exit_offset = transit_region_exit_offset
         self.transfer_region_entry_offset = transfer_region_entry_offset
         self.transfer_region_exit_offset = transfer_region_exit_offset
+        # The solved schedule (see pddl_parser._build_schedule) of the last successful
+        # generate_plan(), for the least-commitment check / re-timing in schedule_repair.py.
+        self.last_schedule = None
 
     def generate_plan(self, env):
         if not hasattr(env, 'create_pddl_problem'):
@@ -88,27 +146,20 @@ class TamerPDDLPlanner:
         except Exception as e:
             raise TamerPlannerError(f"Problem generation failed: {e}")
 
-        try:
-            with OneshotPlanner(name='tamer') as planner:
-                result = planner.solve(problem, timeout=self.timeout)
-        except Exception as e:
-            raise TamerPlannerError(f"Planning failed: {e}")
+        status, solved_plan = _solve_with_wall_clock_timeout(problem, self.timeout)
 
-        if result.status in UNSOLVABLE_STATUSES:
-            raise TamerUnsolvableError(f"Problem proven unsolvable: {result.status}")
-        if result.status == PlanGenerationResultStatus.TIMEOUT:
+        if status in UNSOLVABLE_STATUSES:
+            raise TamerUnsolvableError(f"Problem proven unsolvable: {status}")
+        if status == PlanGenerationResultStatus.TIMEOUT:
             raise TamerTimeoutError(f"Planning exceeded timeout of {self.timeout}s")
-        if result.status not in SOLVED_STATUSES:
-            raise TamerPlannerError(f"Tamer did not produce a plan. Status: {result.status}")
+        if status not in SOLVED_STATUSES:
+            raise TamerPlannerError(f"Tamer did not produce a plan. Status: {status}")
 
-        num_actions = len(result.plan.timed_actions) if hasattr(result.plan, 'timed_actions') \
-            else len(result.plan.actions)
-        print(f"✓ Tamer found a plan with {num_actions} actions")
+        print(f"✓ Tamer found a plan with {len(solved_plan.timed_actions)} actions")
 
         try:
-            plan, action_orders, obj_orders, init_order_constraints = parse_pddl_plan(
-                result.plan, mapper, env,
-            )
+            plan, action_orders, obj_orders, init_order_constraints, self.last_schedule = \
+                parse_pddl_plan(solved_plan, mapper, env, return_schedule=True)
         except Exception as e:
             raise TamerParseError(f"Plan parsing failed: {e}")
 

@@ -35,6 +35,10 @@ def _fold_phase_chain(chain):
     folded = dict(anchor)
     folded['start_time'] = min(p['start_time'] for p in chain)
     folded['end_time'] = max(p['end_time'] for p in chain)
+    # The occupy phase's own interval, not start + alpha: Tamer can insert waits between phases,
+    # so this is the region occupancy the solved schedule actually committed to.
+    folded['occupy_start'] = anchor['start_time']
+    folded['occupy_end'] = anchor['end_time']
     return folded
 
 
@@ -81,7 +85,7 @@ def _merge_phased_actions(actions_list):
     return merged
 
 
-def parse_pddl_plan(pddl_plan, mapper, env):
+def parse_pddl_plan(pddl_plan, mapper, env, return_schedule=False):
     """
     Convert PDDL plan to MM-dRRT format.
 
@@ -96,6 +100,7 @@ def parse_pddl_plan(pddl_plan, mapper, env):
             action_orders: dict mapping robot → tuple of action names
             obj_orders: dict mapping obj → list of actions manipulating it
             init_order_constraints: tuple of {'pre': action_name, 'post': action_name}
+        If return_schedule=True, a 5th element: the solved schedule (see _build_schedule).
     """
     plan = {}
     action_orders = defaultdict(list)
@@ -178,7 +183,28 @@ def parse_pddl_plan(pddl_plan, mapper, env):
                                 if (c['pre'], c['post']) not in seen)
     init_order_constraints = handoff_constraints + surface_constraints
 
+    if return_schedule:
+        return plan, dict(action_orders), dict(obj_orders), init_order_constraints, \
+            _build_schedule(actions_list)
     return plan, dict(action_orders), dict(obj_orders), init_order_constraints
+
+
+def _build_schedule(actions_list):
+    """The solved plan's timing, as plain floats, for mm_drrt/utils/schedule_repair.py:
+    [{name, type, robot, movable_obj, region, start, end, occupy_start, occupy_end}] in start-time
+    order. `region` is to_fixed_obj (for transit that is already the surface it picks FROM). An
+    unsplit action (full-duration mutex) occupies its region for its whole [start, end]."""
+    schedule = []
+    for a in sorted(actions_list, key=lambda a: a['start_time']):
+        start, end = float(a['start_time']), float(a['end_time'])
+        schedule.append({
+            'name': a['name'], 'type': a['type'], 'robot': a['robot'],
+            'movable_obj': a['movable_obj'], 'region': a['to_fixed_obj'],
+            'start': start, 'end': end,
+            'occupy_start': float(a.get('occupy_start', start)),
+            'occupy_end': float(a.get('occupy_end', end)),
+        })
+    return schedule
 
 
 def _parse_action(action, action_name, mapper, start_time, end_time):

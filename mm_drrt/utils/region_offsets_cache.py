@@ -9,6 +9,10 @@ repair_region_offsets() already use (not per-robot/per-region -- see
 examples/envs/duration_conflict_rai_env.py's measure_region_offsets() docstring for why). One file
 for the whole repo; entries namespaced by env class name so different environments don't clobber
 each other's cached values.
+
+With main_rai.py's --durations_from_motion, values are [alpha, beta, duration] in seconds of
+velocity-limited motion (mm_drrt/utils/motion_timing.py) and stored under '<EnvClass>:motion_time'
+-- a different unit system from the index-fraction [alpha, beta] entries, so never mixed with them.
 """
 import json
 import os

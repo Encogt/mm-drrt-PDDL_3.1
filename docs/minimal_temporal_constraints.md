@@ -112,6 +112,14 @@ or the offset-measurement mechanism -- both are verified correct at smaller scal
 fewer surfaces) and via direct plan validation. Reducing to one side per action type is itself
 listed above as part of the "scoped approximation."
 
+`main_rai.py` now tries all four offsets first anyway (`--region_offset_mode four`, the default) and
+falls back to the two-offset reduction when Tamer exceeds `--pddl_timeout`. Tamer itself ignores
+`timeout` (`UserWarning: Tamer does not support timeout`), so `TamerPDDLPlanner` runs the solve in a
+forked child process and kills it on expiry (`_solve_with_wall_clock_timeout`). On this environment
+the four-offset problem still times out (confirmed at 15s, 20s and 300s), in both the fraction and
+motion-time units, so the fallback is what actually runs here; `--region_offset_mode two` skips the
+wasted attempt.
+
 ## Validation
 
 - `python compare_region_constraints.py` -- isolated demo problem
@@ -137,26 +145,161 @@ listed above as part of the "scoped approximation."
   motion-derived offsets. (`--env_type exp_duration_conflict_rai` also still works identically --
   the dedicated environment is a thin, same-geometry subclass; see that module's docstring.)
 
-## Future work: the repair / PDDL-feedback loop
+## The repair loop (implemented)
 
-What's implemented here measures a representative trajectory ONCE, offline, before Tamer plans --
-it cannot know the exact trajectory the eventual solved plan will execute for a specific object
-instance (that's the second approximation above). The natural next step is a closed loop:
+The gap described above -- a representative trajectory measured ONCE, offline, before Tamer
+plans, vs. the actual trajectory the eventual solved plan executes for a specific object instance
+-- is now closed by a real feedback loop, not just sketched:
 
-1. Plan with the current best `alpha`/`beta` estimate (as today).
-2. Execute (or refine via `PlanSkeleton`/dRRT*) and measure the ACTUAL entry/exit times the real,
-   plan-specific trajectory produced.
-3. If the actual measurement disagrees with the estimate used to plan -- e.g. the real trajectory
-   enters the region earlier than assumed, so the mutex window planned for was too narrow -- treat
-   that as a **repair** signal: update the region's stored `alpha`/`beta`, and either re-solve the
-   affected part of the plan or flag it for re-verification.
-4. Feed the corrected value back into the PDDL problem generation for the NEXT planning episode
-   (`generate_problem`'s `region_offsets` already accepts exactly this shape -- `sample_region_offsets()`'s
-   output -- so wiring a measured-post-hoc value back in is a data-source change, not an interface
-   change).
+1. **Plan** with the current best `alpha`/`beta` estimate, same as before
+   (`measure_region_offsets()`), now merged with whatever a PRIOR run already learned (step 4).
+2. **Measure the real, plan-specific trajectory.** After `PlanSkeleton.plan_refinement()` produces
+   a `composite_path`, `DurationConflictRaiEnvironment.measure_executed_region_offsets()` extracts
+   each robot's actual dRRT*-refined joint-space path (concatenating `node.sub_local_paths`),
+   splits it into its transit/transfer segments (the grasp event, then the robot's exact return to
+   `carry_conf` -- confirmed via instrumentation to be an exact, zero-distance match, not an
+   approximate threshold), and runs `trajectory_region_fractions()` on each segment -- the SAME
+   measurement primitive `sample_region_offsets()` uses at planning time, just against the real
+   executed path instead of a representative sample.
+3. **Repair.** `mm_drrt/utils/temporal_repair.py`'s `repair_region_offsets()` compares planned vs.
+   measured with a fixed, absolute tolerance (0.5s, not scaled to the sub-interval's own width --
+   deliberately simple, and avoids a tight sub-interval's sensitivity scaling down to noise level).
+   A measured offset outside tolerance in the dangerous direction (entered earlier / exited later
+   than planned) is flagged `violated`; either way, the stored `(alpha, beta)` widens to the union
+   of planned and measured -- unconditionally, so the stored window only ever widens from a
+   real-world observation, never narrows.
 
-This would close the gap between "representative sample" and "the actual plan's trajectory," and
-over repeated runs in a fixed environment, converge the stored offsets toward the true geometry.
-It also implies a policy for what "disagreement" should trigger a repair (a fixed tolerance? relative
-to the sub-interval's own width?) and how aggressively to re-solve vs. just widen the stored window
-defensively -- open design questions, not decided here.
+   **Decision on what a violation does:** it never fails or aborts the run. dRRT*'s own
+   inter-robot collision checking already verified THIS run's composite path is collision-free
+   regardless of what the PDDL-level mutex window assumed -- a violation means the SCHEDULE was built
+   from offsets that under-covered the real geometry. What happens next is `--repair_strategy`
+   (see "Repairing within the run" below). A violation is judged against the window Tamer actually
+   enforced (under the two-offset reduction the transit window runs to the end of the action), but
+   what is stored is the union of the measured planned offsets and the executed ones, so a
+   two-offset run never caches a full-duration window as if it had been measured.
+4. **Feed forward.** `mm_drrt/utils/region_offsets_cache.py` persists the widened `(alpha, beta)`
+   to a small JSON file keyed by environment class name. The NEXT run loads it and merges it with
+   a fresh measurement before planning (step 1) -- confirmed end-to-end over two consecutive runs:
+   run 1 measured, executed, widened, and saved; run 2 loaded that cache, merged it in, planned
+   from the merged value, and widened again from there. With `--durations_from_motion` entries are
+   `[alpha, beta, duration]` in seconds under a separate `<EnvClass>:motion_time` key.
+
+Run via `main_rai.py --region_offsets_from_motion` (same flag as before -- the repair step runs
+automatically whenever it's set and the environment implements `measure_executed_region_offsets()`).
+
+## Least-commitment check
+
+After every Tamer solve (with `--region_mutex_enabled`), `schedule_repair.check_least_commitment()`
+takes the solved schedule (`parse_pddl_plan(..., return_schedule=True)`, which now keeps each
+action's occupy-phase interval) and, for every pair of different robots' actions on the same region,
+compares the actual start gap with `derive_minimal_constraint()`'s theoretical minimum. Each pair is
+`tight` (slack within 0.05s -- Tamer separates mutex-ordered happenings by 0.01), `not-binding`, or
+has its extra delay explained by `robot-sequence` / `object-handoff` / `time-zero`; anything else is
+`unexplained`, i.e. NOT least-commitment. It also flags pairs where Tamer chose the more expensive
+order. On `DurationConflictRaiEnvironment` every run so far reports the drop_pad pair as tight in the
+minimal order (e.g. gap 6.112 vs. minimum 6.102; 0.818 vs. 0.808 in motion time).
+
+## Repairing within the run (Steps 5a/5b)
+
+`--repair_strategy` (default `retime`) decides what a violation does:
+
+- **`retime` (Step 5a).** `schedule_repair.retime_schedule()` keeps the symbolic plan -- same
+  actions, same per-robot, per-object and per-region order -- and re-times it under the measured
+  offsets/durations. Every constraint is a difference constraint `s_v - s_u >= w`: same-robot
+  sequencing and cross-robot handoffs (`s_b - s_a >= d_a`), and the region constraint
+  `s_j - s_i >= beta_ik - alpha_jk` in Tamer's order. The earliest start times are a longest-path
+  solve from a time-zero source (Bellman-Ford); a positive cycle -- or exceeding
+  `--retime_max_makespan_factor` x the solved makespan, if set -- is infeasible and falls through to
+  `resolve`. Example (fraction units): the measured transfer window [3.90, 6.19] instead of the
+  planned [0, 6.10] moves the second transfer from 16.13 to 12.30 and the makespan 26.14 -> 22.31.
+- **`resolve` (Step 5b).** Restore the world, widen the offsets (and durations), regenerate the
+  problem, re-run Tamer and refinement, up to `--max_resolve_attempts` (default 2).
+- **`report`.** The previous behaviour: widen and cache only.
+
+`--repair_tolerance` (default 0.5s) sets what counts as a violation.
+
+## Motion-derived durations (C1)
+
+`--durations_from_motion` times every trajectory under velocity-limited execution
+(`mm_drrt/utils/motion_timing.py`: each step takes `max_j |dq_j| / vmax_j`, Franka limits x
+`--joint_velocity_scale`) instead of using waypoint-index fractions of a declared duration. Index
+fractions depend on interpolation density -- inside one dRRT* composite node the two arms carry
+different waypoint counts (30 vs. 19 observed) -- which is consistent with the +0.5s transfer
+`entry_diff` the fraction mode reported. The measured durations become the PDDL `:duration`s;
+`alpha`/`beta` are seconds into the action.
+
+On the executed side, `executed_action_timeline()` splits each robot's composite path at its
+`carry_conf` visits (one segment per non-return action) and synchronises robots at composite nodes.
+Result on `DurationConflictRaiEnvironment`: the representative pre-planning samples (~1.33s) underestimate
+the executed dRRT* trajectories (~2.76s transit, ~2.90s transfer) by about 2x -- a real violation. One
+`resolve` with the widened durations converges: re-planned 2.764 / 2.895s vs. re-executed 2.743 / 2.891s.
+
+## Motion-based conflict detection (C2)
+
+`--detect_motion_conflicts` sweeps every pair of different robots' executed actions, waypoint against
+waypoint (`--conflict_samples 0` = every waypoint; uniform subsampling can skip a short colliding
+window), through dRRT*'s own `get_inter_robots_collision_fn`. This asks whether ANY time alignment of
+the two motions could collide -- what a mutex has to rule out. For a colliding pair, the conflict
+interval in each action (widened to the neighbouring samples) replaces the region-volume window.
+The report lists shared-region pairs that never collide ("mutex unnecessary") and colliding pairs
+with no shared region ("unanticipated"); `retime` then constrains only the colliding pairs, over
+their conflict intervals. Whether the drop_pad pair collides varies with the refined paths: one run
+found 276 colliding waypoint pairs (a4 [0.40, 1.01] x a5 [0.74, 1.77]), others found the grippers
+within ~5cm but no arm-arm contact. Approximation: attached blocks are not moved with the gripper
+during the sweep.
+
+## Demos and the N-arm scene
+
+`demos/` holds one GUI walkthrough per contribution (see `demos/README.md`); the pipeline they drive
+is `mm_drrt/pipeline_rai.py`, which `main_rai.py` now also imports. Contribution 4 needed more than
+two arms, so `examples/envs/round_table_rai_env.py` (`--env_type exp_round_table`) generates a scene
+with N Frankas around one shared pad. Making N > 2 work surfaced four issues, fixed as follows:
+
+- **Zones next to neighbours.** pandasTable.g's zone offset puts a zone ~0.25 m from the next arm's
+  base at N = 4; zones now sit on the outer side of each arm.
+- **Grasp carry pose.** `get_grasp_gen` built every grasp with the module-default carry pose; it now
+  uses the robot's own `carry_conf`. (Turning the round-table arms' carry pose aside was tried and
+  reverted: sampled pick/place paths then hit an idle neighbour on 5-10% of their waypoints, against
+  none with the standard pose.)
+- **dRRT* parent lookup.** `get_parent_node_index` returns the first tree node with a matching
+  configuration in any subproblem. Every fixed-arm action starts and ends at `carry_conf`, so when
+  all arms are back at carry together, the root matches, and the retraced composite path silently
+  skipped those actions (seen with 3 arms: a "solved" path in which two arms never moved).
+  `rai_drrt_star._parent_node_index` takes the most recent match in the current subproblem.
+- **Global order-constraint check.** `is_violate_order_constraints` disables `connect_to_target`
+  for every robot while any one waits on a precedence, which stalls the search with 4 arms.
+  `--drrt_order_constraints handoff` passes dRRT* only same-object handoffs; region timing is then
+  handled by the schedule (re-timing and the verified asynchronous execution).
+
+dRRT* still has no backtracking: with several arms it can greedily move every arm onto the pad at
+once and then find no collision-free retreat. demo 4 bounds each attempt (`--drrt_time_limit`, 60 s
+by default) and retries with a new seed.
+
+**Asynchronous execution** (`motion_timing.async_schedule`). This re-times Tamer's actions with
+their measured durations, then sweeps the result on a 20 ms grid for robot-robot collisions. A
+collision between two moving actions adds that pair's motion-conflict window. A collision with an
+idle robot (waiting at `carry_conf`) is resolved differently, using the lock-step dRRT* path as a
+witness: the moving action's colliding part is constrained to fall inside the stretch of one of the
+idle robot's own actions during which that robot is clear of it. These are still difference
+constraints, so the re-timing remains a shortest-path solve. The resulting makespans are in
+`demos/README.md`. Against full serialization the minimal intervals always win. Against lock-step
+they win at N = 3 but not at N = 4.
+
+## Future work
+
+- **Downstream enforcement.** Sub-interval precedence exists in Tamer's schedule and in the re-timed
+  schedule, but PlanSkeleton/dRRT* still only receive whole-action precedence
+  (`init_order_constraints`), and dRRT* has no notion of time. Enforcing a partial overlap during
+  execution needs either timed sub-interval constraints in dRRT*'s composite search or a timed
+  executor that follows the re-timed schedule.
+- **Per-(robot, object, region) timing.** Durations and offsets are still collapsed per action type
+  (min entry, max exit, max duration). The fluent mode already has per-(robot, region) offsets;
+  durations would need the same treatment in `pddl_domain.py`.
+- **PDDL-level mutex gating from C2.** Conflict detection feeds re-timing only; the next Tamer solve
+  still applies `occupied` to every shared region. Dropping it for regions with no colliding pair
+  needs a per-region gate in the domain (e.g. an occupy variant that skips `occupied`) and parser
+  support for it.
+- **Unanticipated conflicts back into PDDL.** A colliding pair with no shared region is reported and
+  constrained in re-timing, but not compiled into a new PDDL constraint.
+- **Four offsets at this scale.** See the scaling section: the four-offset problem still times out
+  here, so the two-offset fallback is what runs.

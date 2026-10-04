@@ -79,6 +79,104 @@ def get_trivial_roadmap(conf, attachments=[]):
     return roadmap, heuristic_val
 
 
+def _table_top(C):
+    """World Z of the highest table-like frame's top surface (see replay_composite_path), or None."""
+    table_tops = [f.getPosition()[2] + f.getSize()[2] / 2.0 for f in C.getFrames()
+                  if f.name.startswith('table') and len(f.getSize()) >= 3]
+    return max(table_tops) if table_tops else None
+
+
+def _clamp_held_above_table(C, obj_name, table_top):
+    """Floor clamp for a carried object -- see the table_top comment in replay_composite_path."""
+    obj_frame = C.getFrame(obj_name)
+    pos = obj_frame.getPosition()
+    # No safety margin beyond the natural resting height (table_top + half-extent,
+    # zero clearance) -- matching the exact formula the release branch below uses
+    # for "resting exactly on the surface" (rest_z). A held object naturally sits
+    # at this same zero-clearance height the instant it's grasped, before the arm
+    # has actually lifted it -- adding any positive margin here means that very
+    # first post-grasp waypoint always reads as "penetrating" and gets yanked up,
+    # which is exactly the spurious "block dips when grabbed" pop this was
+    # confirmed (via instrumentation: fired once, at exactly the margin's value, on
+    # every seed regardless of path) to cause. Still correctly catches genuine
+    # mid-carry penetration (pos[2] actually below this height), just no longer
+    # flags the normal, correct starting pose as one.
+    min_z = table_top + np.max(obj_frame.getSize()[:3]) / 2.0
+    if pos[2] < min_z:
+        obj_frame.setPosition([pos[0], pos[1], min_z])
+
+
+def _attach_held(C, gripper_frame, held, table_top, pause_time):
+    """Grasp `held` with gripper_frame during replay -- see replay_composite_path's attach branch."""
+    gripper = C.getFrame(gripper_frame)
+    grip_pos = np.asarray(gripper.getPosition())
+    C.attach(gripper_frame, held)
+    obj_frame = C.getFrame(held)
+    obj_size = np.asarray(obj_frame.getSize()[:3])
+    obj_quat = obj_frame.getQuaternion()
+    obj_pos = np.asarray(obj_frame.getPosition())
+    offset = obj_pos - grip_pos
+    dist = np.linalg.norm(offset)
+    direction = offset / dist if dist > 1e-6 else np.array([0.0, 0.0, -1.0])
+    target_dist = ru.box_support_distance(direction, obj_quat, obj_size)
+    attach_target = grip_pos + direction * target_dist
+    # node.attachments[r] is checked once per node, at its LAST waypoint (see the
+    # comment above this loop), so `held` can flip true before the gripper has
+    # actually finished descending to the true grasp_conf -- confirmed via
+    # instrumentation on a real 2-robot handoff run: at the exact waypoint this fired,
+    # grip_pos was still 4.3cm from the object while target_dist (the correct
+    # FINAL touching offset) was 7.5cm, so extrapolating grip_pos - direction *
+    # target_dist overshot straight through the object's already-correct resting pose
+    # and out the other side -- 3.2cm below the table's surface. _animate_to_pose then
+    # smoothly dragged the box down into the table over its interpolation, which is
+    # exactly the "block dips below the table, then pops back up" visible bug (the pop
+    # being the *next* node's own table_top floor clamp -- below, in the main
+    # per-waypoint loop -- finally catching the too-low box once the gripper's genuine
+    # upward motion carries it back past the resting height). That floor clamp doesn't
+    # cover this animation at all, so apply the same floor here.
+    if table_top is not None:
+        min_z = table_top + np.max(obj_size) / 2.0
+        attach_target[2] = max(attach_target[2], min_z)
+    _animate_to_pose(C, held, attach_target, obj_quat, pause_time)
+    currently_attached[r] = held
+    # Finger opening width also uses box_support_distance, along the direction the
+    # fingers actually separate on (rai_utils.gripper_finger_axis) rather than the
+    # object's own local X/Y size -- a top grasp permits free rotation around the
+    # approach axis, so the box's footprint across the fingers' real closing
+    # direction varies with that rotation and isn't just its narrowest local
+    # dimension (confirmed: the previous min(obj_size[0], obj_size[1]) heuristic
+    # clipped whenever a solve landed on an orientation wider than that assumption).
+    finger_axis = ru.gripper_finger_axis(C, gripper_frame)
+    half_width = ru.box_support_distance(finger_axis, obj_quat, obj_size)
+    ru.set_gripper_fingers(C, gripper_frame, half_width + 0.003)
+
+
+def _release_to(C, gripper_frame, obj_name, dest_frame_name, pause_time):
+    """Release obj_name onto dest_frame_name during replay -- see replay_composite_path."""
+    C.attach(dest_frame_name, obj_name)
+    # C.attach() only reparents -- it preserves whatever world pose the object
+    # happened to have at this exact replay waypoint, which (same node-boundary
+    # granularity issue as above) can be short of where the plan actually intended it
+    # to land, leaving it floating above the surface instead of resting on it. Snap it
+    # down explicitly, using the same formula every placement was originally sampled
+    # with (sample_placement(), rai_utils.py): resting exactly on the destination
+    # surface, upright. Keeps the object's current X/Y (already close, since the arm's
+    # planned path targets the right horizontal position) and only corrects height +
+    # orientation, which is what "floating above the ground" actually is. Applied via
+    # a short smooth interpolation (_animate_to_pose) so the object visibly settles
+    # onto the surface instead of teleporting there.
+    dest = C.getFrame(dest_frame_name)
+    dest_pos = np.asarray(dest.getPosition())
+    dest_size = np.asarray(dest.getSize()[:3])
+    obj_frame = C.getFrame(obj_name)
+    obj_size = np.asarray(obj_frame.getSize()[:3])
+    cur_pos = np.asarray(obj_frame.getPosition())
+    rest_z = dest_pos[2] + dest_size[2] / 2.0 + obj_size[2] / 2.0
+    _animate_to_pose(C, obj_name, [cur_pos[0], cur_pos[1], rest_z], [1.0, 0.0, 0.0, 0.0], pause_time)
+    ru.set_gripper_fingers(C, gripper_frame)
+
+
+
 def replay_composite_path(C, composite_path, joints, release_targets, gripper_frames=None, pause_time=0.02):
     """Step C through a solved composite_path (list of OptimalNode, from PlanSkeleton.plan_refinement)
     in the live viewer. Neither this pipeline nor the pybullet original animates the plan on its own
@@ -139,9 +237,7 @@ def replay_composite_path(C, composite_path, joints, release_targets, gripper_fr
     # final waypoint (the exact grasp/place conf the composite-path tightening pass,
     # rai_drrt_star.py, carefully aligned onto), which visibly broke grasp centering. This
     # simpler correction only ever touches the object's own position, never the arm's path.
-    table_tops = [f.getPosition()[2] + f.getSize()[2] / 2.0 for f in C.getFrames()
-                 if f.name.startswith('table') and len(f.getSize()) >= 3]
-    table_top = max(table_tops) if table_tops else None
+    table_top = _table_top(C)
     for node in composite_path:
         n_j = get_max_length_list(node.sub_local_paths)
         for j in range(n_j):
@@ -155,22 +251,7 @@ def replay_composite_path(C, composite_path, joints, release_targets, gripper_fr
                 for r in range(num_robots):
                     if not currently_attached[r]:
                         continue
-                    obj_frame = C.getFrame(currently_attached[r])
-                    pos = obj_frame.getPosition()
-                    # No safety margin beyond the natural resting height (table_top + half-extent,
-                    # zero clearance) -- matching the exact formula the release branch below uses
-                    # for "resting exactly on the surface" (rest_z). A held object naturally sits
-                    # at this same zero-clearance height the instant it's grasped, before the arm
-                    # has actually lifted it -- adding any positive margin here means that very
-                    # first post-grasp waypoint always reads as "penetrating" and gets yanked up,
-                    # which is exactly the spurious "block dips when grabbed" pop this was
-                    # confirmed (via instrumentation: fired once, at exactly the margin's value, on
-                    # every seed regardless of path) to cause. Still correctly catches genuine
-                    # mid-carry penetration (pos[2] actually below this height), just no longer
-                    # flags the normal, correct starting pose as one.
-                    min_z = table_top + np.max(obj_frame.getSize()[:3]) / 2.0
-                    if pos[2] < min_z:
-                        obj_frame.setPosition([pos[0], pos[1], min_z])
+                    _clamp_held_above_table(C, currently_attached[r], table_top)
             C.view(False)
             time.sleep(pause_time)
         # Attach/detach checked once per node, at its LAST waypoint -- not at every waypoint
@@ -204,72 +285,53 @@ def replay_composite_path(C, composite_path, joints, release_targets, gripper_fr
                 # Applied via a short smooth interpolation (_animate_to_pose), not an instant
                 # position overwrite, since even a small single-frame jump reads as an
                 # unnatural "snap".
-                gripper = C.getFrame(gripper_frames[r])
-                grip_pos = np.asarray(gripper.getPosition())
-                C.attach(gripper_frames[r], held)
-                obj_frame = C.getFrame(held)
-                obj_size = np.asarray(obj_frame.getSize()[:3])
-                obj_quat = obj_frame.getQuaternion()
-                obj_pos = np.asarray(obj_frame.getPosition())
-                offset = obj_pos - grip_pos
-                dist = np.linalg.norm(offset)
-                direction = offset / dist if dist > 1e-6 else np.array([0.0, 0.0, -1.0])
-                target_dist = ru.box_support_distance(direction, obj_quat, obj_size)
-                attach_target = grip_pos + direction * target_dist
-                # node.attachments[r] is checked once per node, at its LAST waypoint (see the
-                # comment above this loop), so `held` can flip true before the gripper has
-                # actually finished descending to the true grasp_conf -- confirmed via
-                # instrumentation on a real 2-robot handoff run: at the exact waypoint this fired,
-                # grip_pos was still 4.3cm from the object while target_dist (the correct
-                # FINAL touching offset) was 7.5cm, so extrapolating grip_pos - direction *
-                # target_dist overshot straight through the object's already-correct resting pose
-                # and out the other side -- 3.2cm below the table's surface. _animate_to_pose then
-                # smoothly dragged the box down into the table over its interpolation, which is
-                # exactly the "block dips below the table, then pops back up" visible bug (the pop
-                # being the *next* node's own table_top floor clamp -- below, in the main
-                # per-waypoint loop -- finally catching the too-low box once the gripper's genuine
-                # upward motion carries it back past the resting height). That floor clamp doesn't
-                # cover this animation at all, so apply the same floor here.
-                if table_top is not None:
-                    min_z = table_top + np.max(obj_size) / 2.0
-                    attach_target[2] = max(attach_target[2], min_z)
-                _animate_to_pose(C, held, attach_target, obj_quat, pause_time)
+                _attach_held(C, gripper_frames[r], held, table_top, pause_time)
                 currently_attached[r] = held
-                # Finger opening width also uses box_support_distance, along the direction the
-                # fingers actually separate on (rai_utils.gripper_finger_axis) rather than the
-                # object's own local X/Y size -- a top grasp permits free rotation around the
-                # approach axis, so the box's footprint across the fingers' real closing
-                # direction varies with that rotation and isn't just its narrowest local
-                # dimension (confirmed: the previous min(obj_size[0], obj_size[1]) heuristic
-                # clipped whenever a solve landed on an orientation wider than that assumption).
-                finger_axis = ru.gripper_finger_axis(C, gripper_frames[r])
-                half_width = ru.box_support_distance(finger_axis, obj_quat, obj_size)
-                ru.set_gripper_fingers(C, gripper_frames[r], half_width + 0.003)
             elif not held and currently_attached[r]:
-                obj_name = currently_attached[r]
-                dest_frame_name = release_targets[(r, obj_name)]
-                C.attach(dest_frame_name, obj_name)
-                # C.attach() only reparents -- it preserves whatever world pose the object
-                # happened to have at this exact replay waypoint, which (same node-boundary
-                # granularity issue as above) can be short of where the plan actually intended it
-                # to land, leaving it floating above the surface instead of resting on it. Snap it
-                # down explicitly, using the same formula every placement was originally sampled
-                # with (sample_placement(), rai_utils.py): resting exactly on the destination
-                # surface, upright. Keeps the object's current X/Y (already close, since the arm's
-                # planned path targets the right horizontal position) and only corrects height +
-                # orientation, which is what "floating above the ground" actually is. Applied via
-                # a short smooth interpolation (_animate_to_pose) so the object visibly settles
-                # onto the surface instead of teleporting there.
-                dest = C.getFrame(dest_frame_name)
-                dest_pos = np.asarray(dest.getPosition())
-                dest_size = np.asarray(dest.getSize()[:3])
-                obj_frame = C.getFrame(obj_name)
-                obj_size = np.asarray(obj_frame.getSize()[:3])
-                cur_pos = np.asarray(obj_frame.getPosition())
-                rest_z = dest_pos[2] + dest_size[2] / 2.0 + obj_size[2] / 2.0
-                _animate_to_pose(C, obj_name, [cur_pos[0], cur_pos[1], rest_z], [1.0, 0.0, 0.0, 0.0], pause_time)
-                ru.set_gripper_fingers(C, gripper_frames[r])
+                _release_to(C, gripper_frames[r], currently_attached[r],
+                            release_targets[(r, currently_attached[r])], pause_time)
                 currently_attached[r] = None
+
+
+def replay_timed(C, execution, joints, release_targets, gripper_frames, dt=0.02, speed=1.0,
+                 clock_every=0.5):
+    """Plays an asynchronous execution (motion_timing.AsyncExecution) in the viewer against
+    wall-clock time: every robot follows its own timed trajectory, grasping/releasing at its own
+    event times -- unlike replay_composite_path, nobody waits at dRRT*'s composite nodes. Prints a
+    running clock with what each robot is doing. speed > 1 plays faster than real time."""
+    num_robots = len(joints)
+    table_top = _table_top(C)
+    for gf in gripper_frames:
+        ru.set_gripper_fingers(C, gf)
+    attached = [None] * num_robots
+    pending = list(execution.events)
+    next_clock = 0.0
+    t = 0.0
+    while t <= execution.makespan + dt:
+        for r in range(num_robots):
+            q = execution.conf(r, t)
+            if q is not None:
+                ru.set_joint_positions(C, joints[r], list(q)[-len(joints[r]):])
+        while pending and pending[0].time <= t:
+            e = pending.pop(0)
+            if e.kind == 'grasp':
+                _attach_held(C, gripper_frames[e.robot_index], e.obj, table_top, 0.0)
+                attached[e.robot_index] = e.obj
+            else:
+                _release_to(C, gripper_frames[e.robot_index], e.obj,
+                            release_targets[(e.robot_index, e.obj)], 0.0)
+                attached[e.robot_index] = None
+        if table_top is not None:
+            for r in range(num_robots):
+                if attached[r]:
+                    _clamp_held_above_table(C, attached[r], table_top)
+        if t >= next_clock:
+            doing = '  '.join(f"r{r}:{execution.active(r, t)[0] or '-'}" for r in range(num_robots))
+            print(f"  t={t:5.2f}s  {doing}")
+            next_clock += clock_every
+        C.view(False)
+        time.sleep(dt / speed)
+        t += dt
 
 
 def plan_joint_motion(robot, joints, end_conf, obstacles=[], attachments=[],
@@ -384,10 +446,13 @@ def get_ir_sampler(robot, gripper, custom_limits={}, max_attempts=25, collisions
 
 def get_grasp_gen(grasp_type, collisions=False, randomize=True):
     def fn(robot, body):
+        # The grasp's carry pose is where every approach starts and every retrieval ends, so it has
+        # to be THIS robot's own carry_conf (RoundTableRaiEnvironment turns its arms' carry aside).
+        carry = ru._spec_of(robot)[3]
         if grasp_type == 'top':
-            grasps = ru.get_top_grasps(body)
+            grasps = ru.get_top_grasps(body, carry=carry)
         elif grasp_type == 'side':
-            grasps = ru.get_side_grasps(body)
+            grasps = ru.get_side_grasps(body, carry=carry)
         else:
             raise ValueError('Unexpected grasp type:', grasp_type)
         if randomize:
@@ -770,7 +835,7 @@ def trajectory_region_fractions(robot, arm_joints, gripper_frame, path, region):
 def sample_region_offsets(robot, arm, grasp_type, m_obj, region_frame, action_type, duration,
                           height_margin=DEFAULT_HEIGHT_MARGIN, num_arm_samples=100,
                           collision_objs=(), max_grasp_attempts=5, arm_joints=None,
-                          gripper_frame=None, use_debug=False):
+                          gripper_frame=None, use_debug=False, velocity_limits=None, return_path=False):
     """Samples ONE representative arm trajectory into/out of region_frame -- 'transit' picks m_obj
     up FROM a pose sampled in region_frame, 'transfer' places it ONTO one -- and measures, via
     trajectory_region_fractions, the fraction of that trajectory during which the gripper is
@@ -786,6 +851,13 @@ def sample_region_offsets(robot, arm, grasp_type, m_obj, region_frame, action_ty
     bookkeeping, since this has to run BEFORE Tamer has produced a plan to refine. It therefore
     measures a representative sample (any valid grasp/placement for m_obj at region_frame), not
     the specific trajectory the eventual plan will execute.
+
+    With velocity_limits (per-arm-joint rad/s, see mm_drrt/utils/motion_timing.py) the sample is
+    timed instead of index-scaled: returns (t_entry, t_exit, total_time) in seconds of
+    velocity-limited motion, and `duration` is unused.
+
+    With return_path, returns (that result, the sampled joint-space path) instead -- for animating
+    the representative trajectory (demos/demo2_motion_intervals.py).
     """
     C = ru._config_of(robot)
     arm_joints, gripper_frame, _, carry_conf = ru._spec_of(robot, arm_joints, gripper_frame)
@@ -833,10 +905,18 @@ def sample_region_offsets(robot, arm, grasp_type, m_obj, region_frame, action_ty
             continue
 
         full_path = _extract_roadmap_path(approach_roadmap) + _extract_roadmap_path(retrieval_roadmap)
+        if velocity_limits is not None:
+            from mm_drrt.utils.motion_timing import trajectory_region_times
+            t_entry, t_exit, total = trajectory_region_times(robot, arm_joints, gripper_frame,
+                                                             full_path, region, velocity_limits)
+            if t_entry is None:
+                continue
+            return ((t_entry, t_exit, total), full_path) if return_path else (t_entry, t_exit, total)
         fractions = trajectory_region_fractions(robot, arm_joints, gripper_frame, full_path, region)
         if fractions is None:
             continue
         alpha_frac, beta_frac = fractions
-        return alpha_frac * duration, beta_frac * duration
+        result = (alpha_frac * duration, beta_frac * duration)
+        return (result, full_path) if return_path else result
 
     return None

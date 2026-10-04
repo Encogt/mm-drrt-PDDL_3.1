@@ -261,6 +261,18 @@ class DurationConflictRaiEnvironment(Environment):
     def restore_world(self, saved_world):
         ru.restore_world(saved_world)
 
+    def _robot_zones(self):
+        """(robot index, that robot's private pick zone) for every robot -- the subclass hook
+        RoundTableRaiEnvironment overrides for N arms."""
+        return [(0, self.f_objs[0]), (1, self.f_objs[1])]
+
+    def _region_samples(self):
+        """(robot, block, region, action type) for every conflict-relevant action: each robot
+        transits from its own zone and transfers onto the shared drop_pad (f_objs[-1])."""
+        zones = self._robot_zones()
+        return [(self.robots[r], self.m_objs[r], zone, 'transit') for r, zone in zones] + \
+               [(self.robots[r], self.m_objs[r], self.f_objs[-1], 'transfer') for r, zone in zones]
+
     def measure_region_offsets(self, duration=10.0):
         """Motion-derived alpha_ik/beta_ik for this environment's two conflict-relevant action
         types (robot0 transiting from zone_left, robot1 transiting from zone_right, both
@@ -294,12 +306,7 @@ class DurationConflictRaiEnvironment(Environment):
         from mm_drrt.utils.rai_motion_planner_utils import sample_region_offsets
 
         samples = {'transit': [], 'transfer': []}
-        for robot, m_obj, region, action_type in [
-            (self.robots[0], self.m_objs[0], self.f_objs[0], 'transit'),
-            (self.robots[1], self.m_objs[1], self.f_objs[1], 'transit'),
-            (self.robots[0], self.m_objs[0], self.f_objs[2], 'transfer'),
-            (self.robots[1], self.m_objs[1], self.f_objs[2], 'transfer'),
-        ]:
+        for robot, m_obj, region, action_type in self._region_samples():
             saved_world = self.save_world()
             result = sample_region_offsets(robot, self._arm, self._grasp_type, m_obj, region,
                                            action_type, duration, collision_objs=self.fixed_obstacles)
@@ -313,6 +320,47 @@ class DurationConflictRaiEnvironment(Environment):
             offsets[action_type] = (min(a for a, b in measured), max(b for a, b in measured)) \
                 if measured else (0.0, duration)
         return offsets
+
+    def measure_region_timing(self, vel_scale=1.0, fallback_duration=10.0, samples_per_pair=3):
+        """C1 counterpart to measure_region_offsets(): the same four representative samples, but
+        TIMED under velocity-limited execution (mm_drrt/utils/motion_timing.py) instead of
+        index-fractions scaled to a declared duration -- so the durations themselves come from the
+        motion too.
+
+        Each (robot, region) pair is sampled samples_per_pair times and the SHORTEST valid sample is
+        kept: one sampled PRM path can be a large detour (observed: an 11.9s transit next to an
+        executed 2.2s one), and the collapse below takes the max across robots, so one outlier would
+        inflate the duration of every action of that type. Under-estimates are what the repair loop
+        (main_rai.py) widens from the executed path.
+
+        Returns {'transit': (alpha, beta, duration), 'transfer': (alpha, beta, duration)}, collapsed
+        across robots the same way (min entry, max exit, max duration). An action type with no
+        valid sample falls back to a full-duration mutex over fallback_duration."""
+        from mm_drrt.utils.rai_motion_planner_utils import sample_region_offsets
+        from mm_drrt.utils.motion_timing import velocity_limits
+
+        samples = {'transit': [], 'transfer': []}
+        for robot, m_obj, region, action_type in self._region_samples():
+            vlim = velocity_limits(ru._spec_of(robot)[0], vel_scale)
+            results = []
+            for _ in range(samples_per_pair):
+                saved_world = self.save_world()
+                result = sample_region_offsets(robot, self._arm, self._grasp_type, m_obj, region,
+                                               action_type, None, collision_objs=self.fixed_obstacles,
+                                               velocity_limits=vlim)
+                self.restore_world(saved_world)
+                if result is not None:
+                    results.append(result)
+            if results:
+                samples[action_type].append(min(results, key=lambda abd: abd[2]))
+
+        timing = {}
+        for action_type in ('transit', 'transfer'):
+            measured = samples[action_type]
+            timing[action_type] = (min(a for a, b, d in measured), max(b for a, b, d in measured),
+                                   max(d for a, b, d in measured)) \
+                if measured else (0.0, fallback_duration, fallback_duration)
+        return timing
 
     def measure_executed_region_offsets(self, composite_path, duration=10.0):
         """The EXECUTED-path counterpart to measure_region_offsets(): measures each robot's REAL,
@@ -346,7 +394,7 @@ class DurationConflictRaiEnvironment(Environment):
         import numpy as np
 
         samples = {'transit': [], 'transfer': []}
-        for r, zone in ((0, self.f_objs[0]), (1, self.f_objs[1])):
+        for r, zone in self._robot_zones():
             robot = self.robots[r]
             arm_joints, gripper_frame, _, carry_conf = ru._spec_of(robot)
             carry = np.asarray(carry_conf)

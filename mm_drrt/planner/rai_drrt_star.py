@@ -69,6 +69,21 @@ def _advance_past_trivial(sub_q, sub_goals, subprob_id, goals, joint_dim, roadma
                 advanced = True
     return sub_q_last, sub_goals
 
+def _parent_node_index(nodes, sub_q_near, subprob_id):
+    """get_parent_node_index, but subprob-aware: the MOST RECENT node at this configuration in the
+    current subprob. get_parent_node_index returns the first node with a matching config,
+    whichever subprob it belongs to -- and for fixed arms every action starts and ends at
+    carry_conf, so once all robots are back at carry (e.g. three arms finishing their picks
+    together) the composite config equals the ROOT's. Connecting to the next subgoal from the root
+    then retraces a path that skips every action done so far (observed with 3 arms: a 'solved'
+    composite path in which two arms never moved)."""
+    target = tuple(x for q in sub_q_near for x in q)
+    for i in reversed(range(len(nodes))):
+        if nodes[i].config == target and nodes[i].subprob_id == subprob_id:
+            return i
+    return get_parent_node_index(nodes, sub_q_near)
+
+
 MAX_DISTANCE = 0.0  # unused broad-phase margin in the RAI collision backend; kept for signature compat
 
 class dRRTStar:
@@ -258,7 +273,7 @@ class dRRTStar:
                 # subprob_id still advances instead of stalling here forever.
                 if use_debug_verbal: print('Goal has already reached.')
                 if not is_violate_order_constraints(self.order_constraints, self.subprob_id):
-                    parent_node_index = get_parent_node_index(self.nodes, sub_q_near)
+                    parent_node_index = _parent_node_index(self.nodes, sub_q_near, self.subprob_id)
                     local_paths = [[c] for c in sub_q_near]
                     node_pose = get_substarts_subgoals(self.goals, self.subprob_id, self.joint_dim)
                     sub_q_last, sub_goals = _advance_past_trivial(node_pose, sub_goals, self.subprob_id,
@@ -275,7 +290,7 @@ class dRRTStar:
                         is_found_path = True
             else:
                 if not is_violate_order_constraints(self.order_constraints, self.subprob_id):
-                    parent_node_index = get_parent_node_index(self.nodes, sub_q_near)
+                    parent_node_index = _parent_node_index(self.nodes, sub_q_near, self.subprob_id)
                     # in connect_to_target, collisions with obstacles are only checked. inter-robot collisions are checked only for starts and goals
                     local_paths = connect_to_target(roadmap=get_subprob(self.roadmaps, self.subprob_id),
                                                     num_robots=self.num_robots,
