@@ -45,6 +45,17 @@ def is_robot_frame(name):
     return name.startswith(ROBOT_FRAME_PREFIXES)
 
 
+def register_robot_frame_prefix(frame_prefix):
+    """Makes is_robot_frame() recognise a Panda arm included with this prefix (its *panda*,
+    *finger*, *palm* and *gripper* frames). ROBOT_FRAME_PREFIXES only lists the two-arm scene's
+    l_/r_ arms; without this, an arm loaded under another prefix (RoundTableRaiEnvironment's p0_,
+    p1_, ...) is not a 'robot' to check_collisions(), so its motions were never checked against
+    the table or the blocks (observed: a wrist 6 cm into the table)."""
+    global ROBOT_FRAME_PREFIXES
+    new = tuple(frame_prefix + part for part in ('panda', 'finger', 'palm', 'gripper'))
+    ROBOT_FRAME_PREFIXES = ROBOT_FRAME_PREFIXES + tuple(x for x in new if x not in ROBOT_FRAME_PREFIXES)
+
+
 ##### Multi-robot identity (see plan: RaiRobot wrapper) #####
 
 class ArmSpec(object):
@@ -58,6 +69,8 @@ class ArmSpec(object):
         self.frame_prefix = frame_prefix
         self.carry_conf = tuple(carry_conf)
         self.base_joints = list(base_joints)
+        if frame_prefix:
+            register_robot_frame_prefix(frame_prefix)
 
 
 class RaiRobot(object):

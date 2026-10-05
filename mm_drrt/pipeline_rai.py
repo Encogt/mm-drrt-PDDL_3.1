@@ -33,7 +33,8 @@ from mm_drrt.utils.temporal_repair import repair_region_offsets, DEFAULT_TOLERAN
 from mm_drrt.utils.region_offsets_cache import load_cached_offsets, save_cached_offsets
 from mm_drrt.utils.schedule_repair import check_least_commitment, is_least_commitment, \
     offsets_by_action, durations_by_action, retime_schedule
-from mm_drrt.utils.motion_timing import executed_action_timeline, collapse_by_type, detect_motion_conflicts
+from mm_drrt.utils.motion_timing import executed_action_timeline, collapse_by_type, detect_motion_conflicts, \
+    contact_events
 
 
 def build_parser():
@@ -556,13 +557,21 @@ def release_targets_and_grippers(env, plan):
     return release_targets, gripper_frames
 
 
-def replay_lockstep(C, env, plan, composite_path):
+def replay_lockstep(C, env, plan, composite_path, action_orders=None):
     """Replays composite_path in the viewer, all robots stepping together through every dRRT*
-    composite node (the synchronous execution the composite path encodes)."""
+    composite node (the synchronous execution the composite path encodes). With action_orders,
+    grasps/releases happen at the waypoint where the gripper really reaches the object/surface
+    (motion_timing.contact_events) instead of at dRRT* node boundaries."""
     robots = list(env.robots.values())
     release_targets, gripper_frames = release_targets_and_grippers(env, plan)
+    events = None
+    if action_orders is not None:
+        try:
+            events = contact_events(executed_action_timeline(env, composite_path, action_orders, plan))
+        except Exception as e:  # best effort: fall back to node-boundary grasps/releases
+            print(f"Note: replaying with node-boundary grasps/releases ({type(e).__name__}: {e})")
     replay_composite_path(C, composite_path, env.get_joints(robots), release_targets,
-                          gripper_frames=gripper_frames)
+                          gripper_frames=gripper_frames, events=events)
 
 
 def refine(env, opt, plan, obj_orders, init_order_constraints):

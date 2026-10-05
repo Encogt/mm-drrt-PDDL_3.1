@@ -1,6 +1,6 @@
 #!/usr/bin/env python
 """N Franka arms (N >= 2) around one shared drop_pad -- the scalability scenario for
-demos/demo4_async_scaling.py.
+demos/demo4.py.
 
 The arms stand evenly spaced on a circle of radius ARM_RADIUS around the pad, each yawed to face
 it. Every arm has its own private zone holding one block, beside its base on the outside of
@@ -92,6 +92,9 @@ def arm_spec(i):
 
 
 class RoundTableRaiEnvironment(DurationConflictRaiEnvironment):
+    # Leave room for the fingers between placed blocks (see DurationConflictRaiEnvironment).
+    PLACEMENT_CLEARANCE = 0.03
+
     def __init__(self, num_robots, num_objs, arm, grasp_type, sim_id, seed):
         Environment.__init__(self, num_objs, seed)
         if num_robots < 2 or num_objs != num_robots or num_robots > len(BLOCK_COLORS):

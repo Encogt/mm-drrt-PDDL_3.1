@@ -12,8 +12,8 @@ unchanged PlanSkeleton/dRRT* refinement turns it into motion. Finally the goal c
 box relay) and nothing has to be rewritten.
 
 Usage:
-    python demos/demo1_no_skeleton.py            # GUI walkthrough
-    python demos/demo1_no_skeleton.py --no_gui   # headless
+    python demos/demo1.py            # GUI walkthrough
+    python demos/demo1.py --no_gui   # headless
 """
 from _walkthrough import demo_args, Walkthrough, pipeline_opt, setup_scene, close_scene, gantt, \
     schedule_rows, replay_sync, table, robot_index
@@ -113,7 +113,7 @@ def run_scenario(w, args, num_objs, label):
         print(f"  refinement took {secs:.1f}s; composite path has {len(composite_path)} nodes")
         if w.use_gui:
             w.say("Replaying in the viewer...")
-            replay_sync(C, env, plan, composite_path, w.use_gui)
+            replay_sync(C, env, plan, composite_path, w.use_gui, action_orders)
         w.pause()
         return plan
     finally:

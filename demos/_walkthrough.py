@@ -168,11 +168,11 @@ def lockstep_rows(timeline):
     return [(f"r{r}", rows[r]) for r in sorted(rows)]
 
 
-def replay_sync(C, env, plan, composite_path, use_gui):
+def replay_sync(C, env, plan, composite_path, use_gui, action_orders=None):
     if not use_gui:
         return
     start = time.time()
-    replay_lockstep(C, env, plan, composite_path)
+    replay_lockstep(C, env, plan, composite_path, action_orders=action_orders)
     print(f"  (lock-step replay took {time.time() - start:.1f}s wall-clock)")
 
 

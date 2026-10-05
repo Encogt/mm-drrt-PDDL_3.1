@@ -67,6 +67,12 @@ SURFACE_Z = 0.6
 
 
 class DurationConflictRaiEnvironment(Environment):
+    # Minimum gap (m) between two placed blocks. 0 here on purpose: this scenario WANTS the two
+    # placements close together (see PAD_SIZE). A gap of 0 lets blocks touch, though, and then the
+    # fingers holding the second block can clip the first (observed: 1.8 cm in a replay) -- the
+    # demo subclasses below ask for room for the fingers.
+    PLACEMENT_CLEARANCE = 0.0
+
     def __init__(self, num_robots, num_objs, arm, grasp_type, sim_id, seed):
         super().__init__(num_objs, seed)
         if num_robots != 2 or num_objs != 2:
@@ -101,11 +107,12 @@ class DurationConflictRaiEnvironment(Environment):
         new_placements = remove_then_add_m_objs + add_then_remove_m_objs + add_m_objs
         for i in range(len(new_placements) - 1):
             for j in range(i + 1, len(new_placements)):
-                if ru.boxes_overlap(self._C, new_placements[i], new_placements[j]):
+                if ru.boxes_overlap(self._C, new_placements[i], new_placements[j], margin=self.PLACEMENT_CLEARANCE):
                     return False, []
 
         for add_m_obj in remove_then_add_m_objs + add_then_remove_m_objs + add_m_objs:
-            if any(ru.boxes_overlap(self._C, add_m_obj, obst) for obst in stationary_m_objs):
+            if any(ru.boxes_overlap(self._C, add_m_obj, obst, margin=self.PLACEMENT_CLEARANCE)
+                   for obst in stationary_m_objs):
                 return False, []
 
         collisions = []
@@ -130,6 +137,7 @@ class DurationConflictRaiEnvironment(Environment):
 
     def subgoal_sampling(self, robot, obj_orders, actions, action, m_obj, start_obstacles, goal_obstacles,
                          custom_limits={}, use_debug=False):
+        self._park_other_arms(robot)
         pick_place_ik_fn = get_fixed_arm_pick_place_ik_gen(
             robot, max_attempts=25,
             start_collision_objs=start_obstacles['objs'] + self.fixed_obstacles,
@@ -161,6 +169,7 @@ class DurationConflictRaiEnvironment(Environment):
     def compute_path(self, robot, action, m_obj, num_base_samples, num_arm_samples, type=None, use_debug=False):
         if type == 'return':
             return True, [], []
+        self._park_other_arms(robot)
 
         start_obstacles = action.obstacles['start']
         goal_obstacles = action.obstacles['goal']
@@ -170,13 +179,16 @@ class DurationConflictRaiEnvironment(Environment):
         copied_objs = []
         if type == 'transfer':
             copied_objs_poses = []
+            # Every goal obstacle -- another block that will rest on the destination -- gets a copy
+            # at that resting pose; the block itself stays an obstacle where it is now. Copying
+            # only blocks that were ALSO start obstacles left the others at their current pose
+            # (still in their zone), so a placement was planned straight through a block another
+            # arm had already put on the pad (observed: a wrist 4 cm into it with 3 arms).
             for id in range(len(goal_obstacles['objs'])):
-                if goal_obstacles['objs'][id] in set(start_obstacles['objs']) & set(goal_obstacles['objs']):
-                    name = 'copied_box_{}'.format(next(_copy_counter))
-                    create_box(self._C, name, (0, 0, -5), BLOCK)
-                    copied_objs.append(name)
-                    copied_objs_poses.append(goal_obstacles['poses'][id].value)
-                    continue
+                name = 'copied_box_{}'.format(next(_copy_counter))
+                create_box(self._C, name, (0, 0, -5), BLOCK)
+                copied_objs.append(name)
+                copied_objs_poses.append(goal_obstacles['poses'][id].value)
             for id in range(len(copied_objs)):
                 ru.Pose(self._C, copied_objs[id], copied_objs_poses[id], action.to_f_obj).assign()
             obstacles = obstacles | set(copied_objs)
@@ -245,6 +257,17 @@ class DurationConflictRaiEnvironment(Environment):
         base_roadmap, base_heuristic_val = get_trivial_roadmap(robot.spec.carry_conf, attachments=trivial_attachments)
         return True, [base_roadmap, arm_approach_roadmap, arm_retrieval_roadmap], \
                [base_heuristic_val, arm_approach_heuristic_val, arm_retrieval_heuristic_val]
+
+    def _park_other_arms(self, robot):
+        """Every other arm back at its carry_conf before planning one arm's grasps/paths. Each
+        arm's own planning checks it against the others' CURRENT poses, and subgoal sampling leaves
+        each arm at its last IK solution -- over the shared pad -- so later arms' IK collided with
+        earlier arms' leftover poses (with 4 arms, every attempt failed). Arm-vs-arm conflicts
+        are dRRT*'s job; individual planning assumes the others parked."""
+        for other in self.robots.values():
+            if other is not robot:
+                arm_joints, _, _, carry = ru._spec_of(other)
+                ru.set_joint_positions(self._C, arm_joints, carry)
 
     def get_joints(self, robots):
         return [robot.spec.arm_joints for robot in robots]

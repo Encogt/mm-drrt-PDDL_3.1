@@ -43,7 +43,11 @@ if opt.use_gui:
     joints = env.get_joints(robots)
     release_targets, gripper_frames = release_targets_and_grippers(env, plan)
     replay_start = time.time()
-    replay_composite_path(C, composite_path, joints, release_targets, gripper_frames=gripper_frames)
+    events = None
+    if result.timeline:  # grasp/release where the gripper really reaches the block / surface
+        from mm_drrt.utils.motion_timing import contact_events
+        events = contact_events(result.timeline)
+    replay_composite_path(C, composite_path, joints, release_targets, gripper_frames=gripper_frames, events=events)
     replay_elapsed = time.time() - replay_start
     # This is the number that should actually shift between --region_mutex_enabled runs and a
     # stock run: more overlap in the solved plan means fewer total composite-path waypoints to

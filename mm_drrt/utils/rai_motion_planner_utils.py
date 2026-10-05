@@ -138,7 +138,6 @@ def _attach_held(C, gripper_frame, held, table_top, pause_time):
         min_z = table_top + np.max(obj_size) / 2.0
         attach_target[2] = max(attach_target[2], min_z)
     _animate_to_pose(C, held, attach_target, obj_quat, pause_time)
-    currently_attached[r] = held
     # Finger opening width also uses box_support_distance, along the direction the
     # fingers actually separate on (rai_utils.gripper_finger_axis) rather than the
     # object's own local X/Y size -- a top grasp permits free rotation around the
@@ -177,7 +176,8 @@ def _release_to(C, gripper_frame, obj_name, dest_frame_name, pause_time):
 
 
 
-def replay_composite_path(C, composite_path, joints, release_targets, gripper_frames=None, pause_time=0.02):
+def replay_composite_path(C, composite_path, joints, release_targets, gripper_frames=None, pause_time=0.02,
+                          events=None):
     """Step C through a solved composite_path (list of OptimalNode, from PlanSkeleton.plan_refinement)
     in the live viewer. Neither this pipeline nor the pybullet original animates the plan on its own
     -- the pybullet version needs a separate experiments/visualizer.py run against the pickled
@@ -205,6 +205,11 @@ def replay_composite_path(C, composite_path, joints, release_targets, gripper_fr
     an earlier robot's own destination.
     gripper_frames: per-robot gripper frame name to attach a carried object to. Defaults to
     ru.GRIPPER_FRAME for every robot (the single-mobile-robot scenario).
+    events: optional {robot index: {waypoint index in that robot's concatenated path: ('grasp' or
+    'release', object)}} (motion_timing.contact_events). For those robots, grasp/release happen at
+    exactly that waypoint instead of at the end of the node where node.attachments flips -- that
+    node can end before the arm reaches the place pose, and the arm then visibly descends to
+    "place" a block it already released.
     """
     num_robots = len(joints)
     if gripper_frames is None:
@@ -238,6 +243,7 @@ def replay_composite_path(C, composite_path, joints, release_targets, gripper_fr
     # rai_drrt_star.py, carefully aligned onto), which visibly broke grasp centering. This
     # simpler correction only ever touches the object's own position, never the arm's path.
     table_top = _table_top(C)
+    waypoint = [0] * num_robots
     for node in composite_path:
         n_j = get_max_length_list(node.sub_local_paths)
         for j in range(n_j):
@@ -247,6 +253,20 @@ def replay_composite_path(C, composite_path, joints, release_targets, gripper_fr
                     continue
                 q = path_r[-1] if len(path_r) <= j else path_r[j]
                 ru.set_joint_positions(C, joints[r], q)
+                if events and r in events and j < len(path_r):
+                    event = events[r].get(waypoint[r])
+                    waypoint[r] += 1
+                    if event and event[0] == 'grasp' and not currently_attached[r]:
+                        _attach_held(C, gripper_frames[r], event[1], table_top, pause_time)
+                        currently_attached[r] = event[1]
+                    elif event and event[0] == 'release' and currently_attached[r]:
+                        # The release waypoint is the arm's lowest one; clamp first, so the block
+                        # doesn't start its settle animation from inside the table.
+                        if table_top is not None:
+                            _clamp_held_above_table(C, currently_attached[r], table_top)
+                        _release_to(C, gripper_frames[r], currently_attached[r],
+                                    release_targets[(r, currently_attached[r])], pause_time)
+                        currently_attached[r] = None
             if table_top is not None:
                 for r in range(num_robots):
                     if not currently_attached[r]:
@@ -266,6 +286,8 @@ def replay_composite_path(C, composite_path, joints, release_targets, gripper_fr
         # short of its real placement target and the next robot's pickup, correctly planned
         # against the (unreached) intended drop point, could never find it either.
         for r in range(num_robots):
+            if events and r in events:
+                continue  # handled at the exact waypoint above
             held = node.attachments[r] if node.attachments else None
             if held and not currently_attached[r]:
                 # C.attach() only reparents -- it preserves whatever world pose the object
@@ -318,6 +340,8 @@ def replay_timed(C, execution, joints, release_targets, gripper_frames, dt=0.02,
                 _attach_held(C, gripper_frames[e.robot_index], e.obj, table_top, 0.0)
                 attached[e.robot_index] = e.obj
             else:
+                if table_top is not None:  # release happens at the lowest point: clamp first
+                    _clamp_held_above_table(C, e.obj, table_top)
                 _release_to(C, gripper_frames[e.robot_index], e.obj,
                             release_targets[(e.robot_index, e.obj)], 0.0)
                 attached[e.robot_index] = None

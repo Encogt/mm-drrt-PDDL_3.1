@@ -275,15 +275,47 @@ dRRT* still has no backtracking: with several arms it can greedily move every ar
 once and then find no collision-free retreat. demo 4 bounds each attempt (`--drrt_time_limit`, 60 s
 by default) and retries with a new seed.
 
-**Asynchronous execution** (`motion_timing.async_schedule`). This re-times Tamer's actions with
-their measured durations, then sweeps the result on a 20 ms grid for robot-robot collisions. A
-collision between two moving actions adds that pair's motion-conflict window. A collision with an
-idle robot (waiting at `carry_conf`) is resolved differently, using the lock-step dRRT* path as a
-witness: the moving action's colliding part is constrained to fall inside the stretch of one of the
-idle robot's own actions during which that robot is clear of it. These are still difference
-constraints, so the re-timing remains a shortest-path solve. The resulting makespans are in
-`demos/README.md`. Against full serialization the minimal intervals always win. Against lock-step
-they win at N = 3 but not at N = 4.
+**Asynchronous execution** (`motion_timing.async_schedule`). This re-times the plan's actions
+with their measured durations, then sweeps the result on a 20 ms grid. Every pair's order is read
+off dRRT*'s lock-step execution, which is one verified, consistent timeline.
+
+The sweep includes the blocks. Each starts at its initial pose, is attached to its robot's gripper
+at that robot's grasp event, and rests on its destination after release. Collisions are handled
+as follows:
+
+- **Between two moving arms**, or **an arm and a block another arm is carrying:** that pair's
+  conflict window is added as a constraint.
+- **With an idle arm:** the start offset between the two actions is searched for a range where
+  the time-aligned poses are clear, and that range becomes two difference constraints.
+- **With a resting block:** reported, and the lock-step execution, which is always valid, is used.
+
+Grasps and releases, in both the replay and the sweep, happen at the gripper's lowest point inside
+the target region, not at the dRRT* node where the attachment flips. The node can end a few
+waypoints before the arm reaches the place pose.
+
+**Collision bugs found with the round-table scene.**
+
+- **Arm frames not recognised.** `rai_utils.is_robot_frame` only knew the `l_`/`r_` arm frame
+  names, so `p0_`, `p1_`, … arms were never checked against the table or blocks (a wrist went 6 cm
+  into the table). `ArmSpec` now registers its prefixes.
+- **Pad obstacles at the wrong place.** A placement only saw another block at its pad pose if
+  that block was also a start obstacle, so placements were planned through blocks already on the
+  pad. Every goal obstacle now gets a copy at its resting pose.
+- **Leftover arm poses during planning.** Planning one arm checked it against the other arms'
+  leftover IK poses over the pad; with 4 arms every attempt failed. The other arms are now parked
+  at `carry_conf` while one arm's grasps and paths are planned. This also brought N = 4 refinement
+  down from minutes to ~15 s.
+
+**Placement clearance.** Blocks placed on one pad could end up touching, and then the fingers
+holding the second block clipped the first in replay (1.8 cm). `PLACEMENT_CLEARANCE` (3 cm in
+the demo environments, 0 in `DurationConflictRaiEnvironment`) is used as the margin in the
+placement-collision check.
+
+**Handoff order constraints.** `assign_order_constraints` (`rai_task_planner_utils.py`) kept only
+the earliest of another robot's actions an action waits for. In the 2-box crossing relay, `a6`
+waits for `a2` and `a5`, only `a2` survived, and robot 0 picked box1 up before robot 1 had
+placed it. It now keeps the latest, which implies the earlier ones. The PyBullet
+`task_planner_utils.py` has the same loop and was left as is.
 
 ## Future work
 

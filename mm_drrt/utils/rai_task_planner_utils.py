@@ -280,7 +280,12 @@ def assign_order_constraints(robot_plans):
             if pre_set:
                 for i, nr in enumerate(robot_plans.keys()):
                     if r == nr: continue
-                    for j in range(len(robot_plans[nr])):
+                    # The LATEST of nr's actions this one waits for: a robot's subprob_id only
+                    # increases, so waiting for it covers nr's earlier predecessors too. Scanning
+                    # forward and stopping at the first match kept only the EARLIEST one -- e.g. in
+                    # the 2-box crossing relay, a6 waits for a2 and a5 (both robot 1's), and only
+                    # a2 survived, so robot 0 picked box1 up before robot 1 had put it down.
+                    for j in reversed(range(len(robot_plans[nr]))):
                         if robot_plans[nr][j].name in a.order_constraints['pre']:
                             pre_index.append({i: 3 * (j + 1) - 1})    # each action consists of three subactions: base motion, grasp motion, post-grasp motion
                             break

@@ -34,6 +34,9 @@ BLOCK0_PLACEMENT_X_BIAS = 0.03
 
 
 class RegionCoordinationDemoRaiEnvironment(DurationConflictRaiEnvironment):
+    # Leave room for the fingers between placed blocks (see DurationConflictRaiEnvironment).
+    PLACEMENT_CLEARANCE = 0.03
+
     def placement_sample(self, m_objs, f_obj, num_samples):
         if f_obj == 'drop_pad' and m_objs == self.m_objs[0]:
             placement_gen = get_placement_gen(self._C, x_bias=BLOCK0_PLACEMENT_X_BIAS)(m_objs, f_obj)

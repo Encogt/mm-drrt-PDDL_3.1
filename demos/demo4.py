@@ -20,9 +20,9 @@ verified, so it is swept for robot-robot collisions on a 20 ms grid; a collision
 conflict interval and the schedule is re-timed (the asynchronous replanning loop).
 
 Usage:
-    python demos/demo4_async_scaling.py                   # GUI walkthrough, N = 3
-    python demos/demo4_async_scaling.py --num_robots 4    # GUI walkthrough, N = 4 (refinement ~1-2 min)
-    python demos/demo4_async_scaling.py --sweep 2,3       # headless scaling table
+    python demos/demo4.py                   # GUI walkthrough, N = 3
+    python demos/demo4.py --num_robots 4    # GUI walkthrough, N = 4 (refinement ~1-2 min)
+    python demos/demo4.py --sweep 2,3       # headless scaling table
 
 Each N runs in under 5 minutes headless (N = 4 is the slow one: up to 2 dRRT* attempts of 60 s).
 """
@@ -48,6 +48,27 @@ def extra_args(parser):
                         help='dRRT* time limit (s) per refinement attempt')
     parser.add_argument('--refine_attempts', type=int, default=2,
                         help='Refinement attempts (new random seed each) before giving up on this N')
+
+
+def region_overlaps(timeline, abs_occupancy):
+    """[(action, action, seconds)] for every two different robots' occupancies of the SAME region
+    that overlap in time. abs_occupancy: {name: (enter, leave)} in absolute time. Here only the
+    placements on the shared pad can meet -- each pick is from the robot's own zone."""
+    names = [n for n in abs_occupancy if abs_occupancy[n][0] is not None]
+    out = []
+    for i, a in enumerate(names):
+        for b in names[i + 1:]:
+            ta, tb = timeline[a], timeline[b]
+            if ta['robot_index'] == tb['robot_index'] or ta['region'] != tb['region']:
+                continue
+            d = min(abs_occupancy[a][1], abs_occupancy[b][1]) - max(abs_occupancy[a][0], abs_occupancy[b][0])
+            if d > 0:
+                out.append((a, b, d))
+    return out
+
+
+def occupancy_from_rows(rows):
+    return {n: (os_, oe) for _, acts in rows for n, s, e, os_, oe in acts}
 
 
 def tamer(env, **kwargs):
@@ -130,13 +151,19 @@ def run(n, args, w):
         w.pause()
 
         w.step("Execute the same paths four ways",
-               """lock-step: robots synchronise at every composite node. The three asynchronous
-               variants re-time Tamer's actions (same actions, same orders) with each action's
-               MEASURED duration, differing only in what is kept apart on the pad; each is swept
-               for collisions and re-timed on any hit.""")
+               """lock-step: dRRT*'s own execution, robots synchronised at every composite node.
+               dRRT* only avoids collisions -- it was given no pad mutex -- so two placements CAN
+               overlap on the pad there (measured below). The three asynchronous variants re-time
+               the actions (same actions, same orders) with each action's MEASURED duration and
+               keep placements apart on the pad: whole actions (full mutex), only the measured
+               occupancy intervals (minimal), or only where the motions really collide (motion
+               conflict). Each is swept for collisions and re-timed on any hit.""")
         sync = lockstep_makespan(timeline)
         out['lockstep'] = sync
         gantt(lockstep_rows(timeline), title=f"  lock-step: makespan {sync:.3f}s")
+        overlaps = region_overlaps(timeline, occupancy_from_rows(lockstep_rows(timeline)))
+        print(f"  lock-step pad occupancy overlaps (mutex NOT honoured): "
+              f"{', '.join(f'{a}/{b} {d:.2f}s' for a, b, d in overlaps) or 'none'}")
         sched = minimal['schedule']
         pad_pairs = [(a['name'], b['name'], 0.0, timeline[a['name']]['duration'], 0.0, timeline[b['name']]['duration'])
                      for i, a in enumerate(sched) for b in sched[i + 1:]
@@ -152,13 +179,18 @@ def run(n, args, w):
                                       ('async_motion', 'motion conflict', motion_pairs)):
             res = async_schedule(env, sched, timeline, conflicts=conflicts)
             results[key] = res
-            out[key] = res.makespan if res.feasible else None
+            # No verified asynchronous schedule -> execute the (always valid) lock-step path.
+            out[key] = res.makespan if res.feasible else sync
+            out[key + '_fallback'] = not res.feasible
             print()
             if res.feasible:
                 gantt(timed_rows(timeline, res.starts),
                       title=f"  async, {label}: makespan {res.makespan:.3f}s ({res.rounds} round(s), verified collision-free)")
+                ov = region_overlaps(timeline, occupancy_from_rows(timed_rows(timeline, res.starts)))
+                print(f"    pad occupancy overlaps: {', '.join(f'{a}/{b} {d:.2f}s' for a, b, d in ov) or 'none'}")
             else:
-                print(f"  async, {label}: no collision-free re-timing ({'; '.join(res.log)})")
+                print(f"  async, {label}: no verified collision-free re-timing -> falls back to lock-step "
+                      f"execution ({sync:.3f}s)")
             for line in res.log[:-1]:
                 print(f"    {line}")
         w.pause()
@@ -167,20 +199,27 @@ def run(n, args, w):
         for key, label in (('async_full', 'async, full mutex on the pad'), ('async_min', 'async, minimal intervals'),
                            ('async_motion', 'async, motion conflicts only')):
             m = out[key]
-            rows.append((label, f"{m:.3f}" if m else 'n/a', f"{100 * (m / sync - 1):+.1f}%" if m else ''))
+            rows.append((label + (' (fell back to lock-step)' if out[key + '_fallback'] else ''), f"{m:.3f}",
+                         f"{100 * (m / sync - 1):+.1f}%"))
         table(['execution', 'makespan (s)', 'change vs lock-step'], rows)
         w.pause()
 
         if w.use_gui:
-            w.step("Replay: lock-step", "The composite path, all robots stepping through dRRT*'s nodes together.")
-            replay_sync(C, env, plan, path, w.use_gui)
-            best = min((k for k in ('async_motion', 'async_min') if results[k].feasible),
-                       key=lambda k: results[k].makespan, default=None)
+            w.step("Replay: lock-step",
+                   """The composite path, all robots stepping through dRRT*'s nodes together. This is
+                   dRRT*'s collision-only execution: watch for two arms on the pad at once where the
+                   overlap above says so -- the pad mutex is not part of it.""")
+            replay_sync(C, env, plan, path, w.use_gui, minimal['action_orders'])
+            # Replay the minimal-interval schedule: it is the one that honours the pad mutex
+            # (motion-conflict timing may legitimately overlap placements that never collide).
+            best = next((k for k in ('async_min', 'async_motion') if results[k].feasible), None)
             if best:
                 env.restore_world(initial_world)
                 w.step("Replay: asynchronous",
-                       f"""The same paths, each robot on its own clock ({'motion conflict' if best == 'async_motion'
-                       else 'minimal'} re-timing). The terminal prints what every robot is doing.""")
+                       f"""The scene is reset to the start, then the same paths are replayed with each robot
+                       on its own clock ({'minimal-interval' if best == 'async_min' else 'motion-conflict'}
+                       re-timing){': placements never overlap their pad occupancy intervals' if best == 'async_min'
+                       else ''}. The terminal prints what every robot is doing.""")
                 replay_async(C, env, plan, results[best].execution, w.use_gui, speed=args.speed)
                 w.pause()
         return out
@@ -206,13 +245,16 @@ def main():
            """Makespans in seconds of velocity-limited motion. 'plan' columns are Tamer's schedules
            (with representative durations); the rest execute the same refined paths.""")
     fmt = lambda v: f"{v:.2f}" if isinstance(v, float) else '-'
+    fb = lambda r, k: (fmt(r.get(k)) + ('*' if r.get(k + '_fallback') else ''))
     table(['N', 'Tamer s (min)', 'refine s', 'plan full', 'plan min', 'lock-step', 'async full', 'async min',
            'async motion', 'best async vs lock-step'],
           [(r['N'], fmt(r.get('tamer_min')), fmt(r.get('refine')), fmt(r.get('plan_full')), fmt(r.get('plan_min')),
-            fmt(r.get('lockstep')), fmt(r.get('async_full')), fmt(r.get('async_min')), fmt(r.get('async_motion')),
+            fmt(r.get('lockstep')), fb(r, 'async_full'), fb(r, 'async_min'), fb(r, 'async_motion'),
             (f"{100 * (min(v for v in (r.get('async_min'), r.get('async_motion')) if v) / r['lockstep'] - 1):+.1f}%"
              if r.get('lockstep') and (r.get('async_min') or r.get('async_motion')) else '-'))
            for r in results])
+    if any(r.get(k + '_fallback') for r in results for k in ('async_full', 'async_min', 'async_motion')):
+        print("  * no verified collision-free asynchronous schedule; the lock-step execution is used instead")
 
 
 if __name__ == '__main__':

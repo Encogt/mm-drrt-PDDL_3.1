@@ -18,8 +18,8 @@ walkthrough ends with the per-(robot, region) fluent mode, where each robot keep
 interval and the cheaper of the two orders has to be chosen.
 
 Usage:
-    python demos/demo3_least_commitment.py            # GUI walkthrough
-    python demos/demo3_least_commitment.py --no_gui   # headless
+    python demos/demo3.py            # GUI walkthrough
+    python demos/demo3.py --no_gui   # headless
 """
 import os
 import random
@@ -49,7 +49,7 @@ def solve(env, label, **kwargs):
     planner = TamerPDDLPlanner(timeout=60, **kwargs)
     plan, action_orders, obj_orders, constraints = planner.generate_plan(env)
     makespan = max(a['end'] for a in planner.last_schedule)
-    return dict(label=label, plan=plan, obj_orders=obj_orders, constraints=constraints,
+    return dict(label=label, plan=plan, action_orders=action_orders, obj_orders=obj_orders, constraints=constraints,
                 schedule=planner.last_schedule, makespan=makespan)
 
 
@@ -136,8 +136,8 @@ def main():
             print(f"  {s['label']}: refined in {secs:.1f}s, {len(path)} composite nodes")
             if w.use_gui:
                 env.restore_world(initial_world)
-                w.say(f"Replaying: {s['label']}")
-                replay_sync(C, env, s['plan'], path, w.use_gui)
+                w.say(f"Replaying: {s['label']} (the scene is reset to the start first)")
+                replay_sync(C, env, s['plan'], path, w.use_gui, s['action_orders'])
                 w.pause()
 
         w.step("Per-(robot, region) intervals: choosing the cheaper order",

@@ -118,6 +118,7 @@ def executed_action_timeline(env, composite_path, action_orders, plan, vel_scale
     # waypoint (see replay_composite_path), so that is where a grasp/release happens.
     events = [[] for _ in robots]
     held = [None for _ in robots]
+    node_ends = [[] for _ in robots]  # (last waypoint index of a node, that node's subprob_id[r])
     t_node = 0.0
     for node in composite_path:
         node_end = t_node
@@ -134,6 +135,8 @@ def executed_action_timeline(env, composite_path, action_orders, plan, vel_scale
             if now != held[r]:
                 events[r].append(len(full[r]) - 1)
                 held[r] = now
+            if node.subprob_id and len(node.subprob_id) > r:
+                node_ends[r].append((len(full[r]) - 1, node.subprob_id[r]))
         t_node = node_end
 
     timeline = {}
@@ -148,7 +151,7 @@ def executed_action_timeline(env, composite_path, action_orders, plan, vel_scale
             print(f"Warning: robot {r}: {len(segments)} motion segments vs. {len(names)} actions "
                   f"{names} -- skipping its executed timeline.")
             continue
-        for name, (i0, i1) in zip(names, segments):
+        for k, (name, (i0, i1)) in enumerate(zip(names, segments)):
             a_type, _, m_obj, _, region_frame = plan[name]
             in_segment = [e for e in events[r] if i0 <= e <= i1]
             path = full[r][i0:i1 + 1]
@@ -160,7 +163,9 @@ def executed_action_timeline(env, composite_path, action_orders, plan, vel_scale
                 'start': abs_times[r][i0], 'end': abs_times[r][i1], 'duration': duration,
                 'motion_times': path_timestamps(path, vlims[r]), 'entry': entry, 'exit': exit_,
                 # Where in `path` the grasp (transit) / release (transfer) happens, and of what.
-                'event_index': (in_segment[0] - i0) if in_segment else len(path) - 1,
+                'event_index': _contact_index(node_ends[r], k, i0, i1,
+                                              (in_segment[0] - i0) if in_segment else len(path) - 1),
+                'path_offset': i0,
                 # Absolute (lock-step) time of every waypoint of `path`.
                 'abs_times': abs_times[r][i0:i1 + 1],
                 'obj': m_obj,
@@ -245,6 +250,35 @@ def detect_motion_conflicts(env, timeline, max_samples=None):
     return conflicts
 
 
+def _contact_index(node_ends, k, i0, i1, fallback):
+    """Waypoint (within the action's segment [i0, i1]) where the grasp/release really happens: the
+    end of the robot's approach motion. Each action is 3 roadmap segments (base, approach,
+    retrieval), so action k's approach is subproblem 3k + 1, and dRRT* moves the robot past it
+    exactly when it reaches the approach goal -- the grasp/place configuration. Contact is
+    therefore the last waypoint of the first node whose subprob_id is >= 3k + 2 (checked against
+    the planned grasp_conf: an exact match on every action of the relay and the 3-arm round
+    table).
+
+    Two earlier choices were wrong: the node where node.attachments flips can end a few waypoints
+    before the place pose (the arm then 'placed' an already-released block), and the gripper's
+    lowest point inside the region is not the grasp pose for tall boxes in a large region (the box
+    was yanked 9 cm to the gripper). Falls back to `fallback` if no such node lies in the segment."""
+    for idx, subprob in node_ends:
+        if subprob >= 3 * k + 2:
+            return idx - i0 if i0 <= idx <= i1 else fallback
+    return fallback
+
+
+def contact_events(timeline):
+    """{robot index: {waypoint index in that robot's concatenated composite path: (kind, obj)}}
+    -- the grasp/release of every timed action, for replay_composite_path(events=...)."""
+    events = {}
+    for a in timeline.values():
+        kind = 'grasp' if a['type'] == 'transit' else 'release'
+        events.setdefault(a['robot_index'], {})[a['path_offset'] + a['event_index']] = (kind, a['obj'])
+    return events
+
+
 def lockstep_makespan(timeline):
     """Makespan of the composite path executed SYNCHRONOUSLY: every robot waits at each dRRT*
     composite node for the slowest one (executed_action_timeline's absolute times)."""
@@ -300,26 +334,73 @@ class AsyncExecution(object):
         return list((1 - w) * np.asarray(path[k], dtype=float) + w * np.asarray(path[k + 1], dtype=float))
 
 
-def verify_async(env, execution, dt=0.02):
-    """Sweeps the asynchronous execution on a dt grid with dRRT*'s own inter-robot collision
-    check. Shifting robots relative to each other leaves the timing dRRT* verified, so this is what
-    makes an asynchronous schedule safe to run. Returns None if collision-free, else
-    (t, robot_indices, {robot_index: active action or None}). Same approximation as dRRT*'s check:
-    carried blocks are not attached during the sweep."""
+def verify_async(env, execution, dt=0.02, tolerance=None):
+    """Sweeps the asynchronous execution on a dt grid for collisions. Shifting robots relative to
+    each other leaves the timing dRRT* verified, so this is what makes an asynchronous schedule
+    safe to run. Blocks are part of the sweep: each starts at its initial pose, is attached to its
+    robot's gripper at that robot's grasp event and rests on its destination after the release
+    event. A robot touching a block another robot is carrying counts as a collision between the
+    two robots; touching a resting block it isn't holding is reported with that block.
+
+    Returns None if collision-free, else (t, robot_indices, {robot_index: active action or None},
+    resting_block or None)."""
     from mm_drrt.utils.rai_motion_planner_utils import get_inter_robots_collision_fn
     robots = list(env.robots.values())
     joints = env.get_joints(robots)
+    tolerance = ru.COLLISION_TOLERANCE if tolerance is None else tolerance
     collision_fn = get_inter_robots_collision_fn(robots, joints, num_robots=len(robots))
     carries = [list(ru._spec_of(r)[3]) for r in robots]
+    prefixes = [getattr(getattr(r, 'spec', None), 'frame_prefix', None) for r in robots]
+    grippers = [ru._spec_of(r)[1] for r in robots]
+    C = ru._config_of(robots[0])
+    blocks = list(env.m_objs)
+    destinations = {(e.robot_index, e.obj): execution.timeline[e.action]['region'] for e in execution.events
+                    if e.kind == 'release'}
+
+    def owner_of_frame(name):
+        for r, pre in enumerate(prefixes):
+            if pre and name.startswith(pre):
+                return r
+        return None
+
     saved_world = env.save_world()
     try:
+        for obj in blocks:
+            env.m_objs_init_placements[obj].assign()
+        holder = {}
+        pending = list(execution.events)
         for t in np.arange(0.0, execution.makespan + dt, dt):
             q = [execution.conf(r, t) or carries[r] for r in range(len(robots))]
             q = [list(qr)[-len(joints[r]):] for r, qr in enumerate(q)]
-            colliding = collision_fn(q, mode='index')
+            colliding = collision_fn(q, mode='index')  # also sets every robot's joints
+            while pending and pending[0].time <= t:
+                e = pending.pop(0)
+                if e.kind == 'grasp':
+                    C.attach(grippers[e.robot_index], e.obj)
+                    holder[e.obj] = e.robot_index
+                else:
+                    dest = destinations[(e.robot_index, e.obj)]
+                    C.attach(dest, e.obj)
+                    f, d = C.getFrame(e.obj), C.getFrame(dest)
+                    pos = f.getPosition()
+                    f.setPosition([pos[0], pos[1], d.getPosition()[2] + d.getSize()[2] / 2.0 + f.getSize()[2] / 2.0])
+                    f.setQuaternion([1.0, 0.0, 0.0, 0.0])
+                    holder.pop(e.obj, None)
             if len(colliding) >= 2:
                 return float(t), [int(c) for c in colliding], \
-                    {int(c): execution.active(int(c), t)[0] for c in colliding}
+                    {int(c): execution.active(int(c), t)[0] for c in colliding}, None
+            C.computeCollisions()
+            for x, y, pen in C.getCollisions():
+                if pen >= -tolerance:
+                    continue
+                for robot_frame, obj in ((x, y), (y, x)):
+                    r = owner_of_frame(robot_frame)
+                    if r is None or obj not in blocks or holder.get(obj) == r:
+                        continue
+                    if obj in holder:  # carried by another robot: a robot-robot collision
+                        pair = [r, holder[obj]]
+                        return float(t), pair, {k: execution.active(k, t)[0] for k in pair}, None
+                    return float(t), [r], {r: execution.active(r, t)[0]}, obj
     finally:
         env.restore_world(saved_world)
     return None
@@ -329,15 +410,17 @@ AsyncResult = namedtuple('AsyncResult', ['feasible', 'execution', 'starts', 'mak
                                          'conflicts', 'log'])
 
 
-def _idle_alignment(env, timeline, mover, idle_robot):
-    """An idle robot (waiting at carry_conf between actions) is in `mover`'s way. dRRT*'s lock-step
-    composite path is collision-free, so when `mover` passed that spot there, the idle robot was
-    busy with one of its own actions k, away from carry. Keep that witness: constrain `mover`'s
-    colliding window [u, v] (its motion times whose configs hit the idle robot's carry pose) to lie
-    inside the part of k during which the idle robot clears all of them. Two difference
-    constraints -- s_a - s_k >= j0 - u and s_k - s_a >= v - j1 -- so re-timing stays a
-    shortest-path solve. Returns a list of such constraint pairs, one per usable k (the lock-step
-    witness first), or None."""
+def _idle_alignment(env, timeline, mover, idle_robot, step=0.04):
+    """An idle robot (waiting where its last action ended, normally carry_conf) is in `mover`'s
+    way. dRRT*'s lock-step composite path is collision-free, so when `mover` passed that spot, the
+    idle robot was busy with one of its own actions k. Keep a relation like that one: search the
+    offset o = s_k - s_mover on a `step` grid and keep those for which, at every instant of
+    mover's colliding window [u, v], the idle robot is inside k and its time-aligned pose clears
+    mover's. Each contiguous range [lo, hi] of safe offsets is two difference constraints
+    (s_k - s_a >= lo, s_a - s_k >= -hi), so re-timing stays a shortest-path solve.
+
+    Returns a list of such constraint pairs -- the range containing the lock-step offset first, then
+    the others by distance to it -- or None if none exists."""
     from mm_drrt.utils.rai_motion_planner_utils import get_inter_robots_collision_fn
     robots = list(env.robots.values())
     joints = env.get_joints(robots)
@@ -345,61 +428,47 @@ def _idle_alignment(env, timeline, mover, idle_robot):
     carries = [list(ru._spec_of(r)[3]) for r in robots]
     a = timeline[mover]
     ra = a['robot_index']
+    rest = [timeline[n]['path'][-1] for n in timeline if timeline[n]['robot_index'] == idle_robot] or \
+        [carries[idle_robot]]
 
-    def hits(qa, r, qr):
+    def hits(qa, qr):
         q = list(carries)
         q[ra] = list(qa)[-len(joints[ra]):]
-        q[r] = list(qr)[-len(joints[r]):]
+        q[idle_robot] = list(qr)[-len(joints[idle_robot]):]
         c = collision_fn(q, mode='index')
-        return ra in c and r in c
+        return ra in c and idle_robot in c
 
     saved_world = env.save_world()
     try:
-        bad = [i for i, qa in enumerate(a['path']) if hits(qa, idle_robot, carries[idle_robot])]
+        bad = [i for i, qa in enumerate(a['path']) if any(hits(qa, qr) for qr in (carries[idle_robot], rest[-1]))]
         if not bad:
             return None
-        u_idx, v_idx = max(bad[0] - 1, 0), min(bad[-1] + 1, len(a['path']) - 1)
-        u, v = a['motion_times'][u_idx], a['motion_times'][v_idx]
-        window = a['path'][u_idx:v_idx + 1]
-        # The idle robot's action k that dRRT*'s lock-step solution had running at that moment.
-        t_lock = a['abs_times'][bad[0]]
-        candidates = [n for n, b in timeline.items() if b['robot_index'] == idle_robot]
-        if not candidates:
-            return None
-        # Witness first: the action dRRT*'s lock-step solution had running at that moment, then the
-        # idle robot's other actions (the caller keeps the first that leaves re-timing feasible).
-        candidates.sort(key=lambda n: 0.0 if timeline[n]['start'] <= t_lock <= timeline[n]['end']
-                        else min(abs(timeline[n]['start'] - t_lock), abs(timeline[n]['end'] - t_lock)))
+        window = range(max(bad[0] - 1, 0), min(bad[-1] + 1, len(a['path']) - 1) + 1)
+        ta = a['motion_times']
         options = []
-        for k in candidates:
-            option = _align_inside(timeline, k, mover, window, u, v, idle_robot, hits)
-            if option:
-                options.append(option)
-        return options or None
+        for k in (n for n in timeline if timeline[n]['robot_index'] == idle_robot):
+            b = timeline[k]
+            single = AsyncExecution({k: b}, {k: 0.0}, len(robots))
+            lo_o, hi_o = ta[window[-1]] - b['duration'], ta[window[0]]
+            safe = []
+            for o in np.arange(lo_o, hi_o + 1e-9, step):
+                safe.append((o, all(0.0 <= ta[i] - o <= b['duration'] and
+                                    not hits(a['path'][i], single.conf(idle_robot, ta[i] - o)) for i in window)))
+            # The lock-step offset between the two actions: their absolute starts there.
+            o_lock = b['start'] - a['start']
+            run = []
+            for o, ok in safe + [(None, False)]:
+                if ok:
+                    run.append(o)
+                elif run:
+                    lo, hi = run[0], run[-1]
+                    dist = 0.0 if lo <= o_lock <= hi else min(abs(lo - o_lock), abs(hi - o_lock))
+                    options.append((dist, [(mover, k, lo, 'idle alignment'), (k, mover, -hi, 'idle alignment')]))
+                    run = []
+        options.sort(key=lambda x: x[0])
+        return [o for _, o in options] or None
     finally:
         env.restore_world(saved_world)
-
-
-def _align_inside(timeline, k, mover, window, u, v, idle_robot, hits):
-    """The two alignment constraints keeping mover's window [u, v] inside the longest stretch of
-    action k during which the idle robot clears every config of that window, or None."""
-    b = timeline[k]
-    clear = [not any(hits(qa, idle_robot, qr) for qa in window) for qr in b['path']]
-    # Longest run of k's waypoints that clears the whole colliding window.
-    best, run_start = None, None
-    for j, ok in enumerate(clear + [False]):
-        if ok and run_start is None:
-            run_start = j
-        elif not ok and run_start is not None:
-            if best is None or j - run_start > best[1] - best[0] + 1:
-                best = (run_start, j - 1)
-            run_start = None
-    if best is None:
-        return None
-    t0, t1 = b['motion_times'][best[0]], b['motion_times'][best[1]]
-    if t1 - t0 < v - u:
-        return None
-    return [(k, mover, t0 - u, 'idle alignment'), (mover, k, v - t1, 'idle alignment')]
 
 
 def async_schedule(env, schedule, timeline, conflicts=None, max_rounds=8, dt=0.02):
@@ -413,14 +482,21 @@ def async_schedule(env, schedule, timeline, conflicts=None, max_rounds=8, dt=0.0
       3. on a collision between two active actions, find that pair's conflict interval
          (detect_motion_conflicts restricted to the pair), add it as a constraint and re-time again.
 
+    Pair orders come from dRRT*'s lock-step execution (the timeline's absolute starts).
+
     Returns AsyncResult(feasible, execution, starts, makespan, rounds, conflicts, log); feasible is
     False if re-timing became infeasible, a collision involved an idle robot (no action to
     constrain), or max_rounds ran out -- the caller then falls back to lock-step execution or to
     re-planning (Step 5b)."""
     from mm_drrt.utils.schedule_repair import retime_schedule
 
-    sched = [dict(a) for a in schedule if a['name'] in timeline]
     durations = {n: timeline[n]['duration'] for n in timeline}
+    # Orders (per robot, per handed-over object, per conflicting pair) are read off dRRT*'s
+    # verified lock-step execution, not Tamer's schedule: it is one consistent timeline, and the
+    # idle-robot alignment below is anchored to it too -- mixing the two sources of order produced
+    # contradictory (cyclic, infeasible) constraints with 3 arms.
+    sched = [dict(a, start=timeline[a['name']]['start'], end=timeline[a['name']]['start'] + durations[a['name']])
+             for a in schedule if a['name'] in timeline]
     if conflicts is None:
         conflicts = []
         for x, a in enumerate(sched):
@@ -444,8 +520,12 @@ def async_schedule(env, schedule, timeline, conflicts=None, max_rounds=8, dt=0.0
         if hit is None:
             log.append(f"round {rounds}: makespan {execution.makespan:.3f}, collision-free")
             return AsyncResult(True, execution, result.starts, execution.makespan, rounds, conflicts, log)
-        t, robots_hit, active = hit
+        t, robots_hit, active, resting = hit
         names = [active[r] for r in robots_hit]
+        if resting is not None:
+            log.append(f"round {rounds}: makespan {execution.makespan:.3f}, robot {robots_hit[0]} ({names[0]}) "
+                       f"hits {resting} resting at t={t:.2f}s -- re-timing cannot move a resting block")
+            return AsyncResult(False, execution, result.starts, execution.makespan, rounds, conflicts, log)
         log.append(f"round {rounds}: makespan {execution.makespan:.3f}, collision at t={t:.2f}s "
                    f"between robots {robots_hit} ({names})")
         movers = [n for n in names if n is not None]
@@ -473,8 +553,9 @@ def async_schedule(env, schedule, timeline, conflicts=None, max_rounds=8, dt=0.0
                            f"aligned to clear it")
                 return AsyncResult(False, execution, result.starts, execution.makespan, rounds, conflicts, log)
             extra += chosen
-            log.append(f"  robot {idle} idles in {movers[0]}'s way: keep {movers[0]}'s colliding part inside "
-                       f"{chosen[0][0]}{' (as in dRRT*' + chr(39) + 's lock-step solution)' if chosen is options[0] else ''}")
+            log.append(f"  robot {idle} idles in {movers[0]}'s way: time {movers[0]} against {chosen[0][1]} "
+                       f"(offset in [{chosen[0][2]:.2f}, {-chosen[1][2]:.2f}]s"
+                       f"{', as in dRRT*' + chr(39) + 's lock-step solution' if chosen is options[0] else ''})")
         for a in sched:
             a['start'] = result.starts[a['name']]
             a['end'] = a['start'] + durations[a['name']]

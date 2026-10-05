@@ -16,8 +16,8 @@ against the region's volume, timed under the arm's joint velocity limits. The wa
      planned and executed timing agree.
 
 Usage:
-    python demos/demo2_motion_intervals.py            # GUI walkthrough
-    python demos/demo2_motion_intervals.py --no_gui   # headless
+    python demos/demo2.py            # GUI walkthrough
+    python demos/demo2.py --no_gui   # headless
 """
 import random
 import time
@@ -70,7 +70,10 @@ def main():
     opt = pipeline_opt(w.use_gui, args.seed, '--env_type', 'exp_region_coordination_demo', '--num_robots', '2',
                        '--num_objs', '2', '--use_pddl_planner', '--region_mutex_enabled',
                        '--region_offsets_from_motion', '--durations_from_motion', '--region_offset_mode', 'two',
-                       '--repair_strategy', 'resolve', '--max_resolve_attempts', '2', '--no_offsets_cache')
+                       '--repair_strategy', 'resolve', '--max_resolve_attempts', '2', '--no_offsets_cache',
+                       # A tight tolerance so a 0.1 s planned/executed mismatch already counts:
+                       # the repair loop is what this step demonstrates.
+                       '--repair_tolerance', '0.05')
     C, env = setup_scene(opt)
     try:
         w.step("Scenario and what is being measured",
@@ -90,7 +93,8 @@ def main():
                forward kinematics along the path. alpha/beta are reported two ways: as WAYPOINT-INDEX
                fractions scaled to a declared {DECLARED_DURATION:.0f}s action (the earlier method),
                and as TIME under the Franka joint velocity limits, where the duration itself also
-               comes from the motion.""")
+               comes from the motion. The viewer previews each arm motion only; blocks are not
+               carried in these previews.""")
         rows, measured, paths = [], {'transit': [], 'transfer': []}, {}
         for r in range(2):
             robot = env.robots[r]
@@ -108,10 +112,10 @@ def main():
                 (t_in, t_out, dur), path = out
                 fr = trajectory_region_fractions(robot, arm_joints, gripper_frame, path, regions[frame])
                 print(f"\n  r{r} {action_type} ({'pick from' if action_type == 'transit' else 'place on'} {frame}):")
-                animate(C, robot, path, regions[frame], w.use_gui)
+                # Sampling moved the block to its sampled pose; put the scene back first so the
+                # preview only moves the arm instead of showing the block jump around.
                 env.restore_world(saved)
-                if w.use_gui:
-                    C.view(False)
+                animate(C, robot, path, regions[frame], w.use_gui)
                 rows.append((f"r{r}", action_type, frame, len(path),
                              f"[{fr[0] * DECLARED_DURATION:.2f}, {fr[1] * DECLARED_DURATION:.2f}]",
                              f"[{t_in:.2f}, {t_out:.2f}]", f"{dur:.2f}"))
@@ -160,8 +164,9 @@ def main():
                plan. The executed per-robot trajectories are then split into actions and measured
                exactly the same way. A representative sample is not the trajectory dRRT* actually
                produces, so planned and executed timing can disagree; when the executed motion
-               leaves its planned window or takes longer, the intervals/durations are widened and
-               the plan is re-solved (up to 2 times).""")
+               leaves its planned window or takes longer -- by more than 0.05 s here, deliberately
+               tight -- the intervals/durations are widened and the plan is re-solved (up to 2
+               times).""")
         random.seed(opt.seed)
         np.random.seed(opt.seed)
         result = pipeline_rai.run_pipeline(env, opt, planned, 'demo2')
@@ -178,7 +183,7 @@ def main():
 
         if w.use_gui:
             w.step("Replay", "The refined plan, replayed in the viewer.")
-            replay_sync(C, env, result.plan, result.composite_path, w.use_gui)
+            replay_sync(C, env, result.plan, result.composite_path, w.use_gui, result.action_orders)
 
         w.step("Summary",
                """Coordination-critical intervals [alpha, beta] and action durations come from the
