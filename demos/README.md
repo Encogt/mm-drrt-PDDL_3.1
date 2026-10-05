@@ -16,7 +16,7 @@ python demos/demo1.py
 python demos/demo2.py
 python demos/demo3.py
 python demos/demo4.py --num_robots 3        # --speed 0.5 slows the asynchronous replay down
-python demos/demo4.py --sweep 2,3           # headless scaling table
+python demos/demo4.py --sweep 2,3,4         # headless table over seeds 0,1,2 (--seeds to change; N up to 6)
 ```
 
 Times are seconds of velocity-limited motion (Franka joint velocity limits), not wall-clock time.
@@ -25,37 +25,50 @@ Each demo runs in under 5 minutes headless. The demos re-launch themselves with
 
 ## Results (demo 4 sweep)
 
-From `python demos/demo4.py --sweep 2,3,4 --seeds 0,1,2`. Makespans are in seconds of
-velocity-limited motion, given as mean [min, max] over 3 seeds; each (N, seed) run took 5-80 s.
+From `python demos/demo4.py --sweep 2,3,4 --seeds 0,1,2 --no_gui`; all 9 (N, seed) runs succeeded,
+each in 5-97 s. Makespans are in seconds of velocity-limited motion, given as mean [min, max] over
+the 3 seeds. All executions in a run use the same refined paths.
 
-**Planned (Tamer): full mutex vs minimal intervals.** Minimal is shorter at every N and every
-seed.
+Demo 4 asks whether the minimal intervals avoid whole-action serialization while still
+honouring the pad mutex. The baseline is therefore **async full mutex**: whole placements kept
+apart on the pad.
 
-| N | full mutex | minimal | minimal vs full |
-|---|---|---|---|
-| 2 | 4.02 [3.93, 4.06] | 3.66 [3.60, 3.69] | -8.8% |
-| 3 | 7.83 [6.60, 8.64] | 7.09 [5.87, 7.88] | -9.5% |
-| 4 | 7.09 [6.50, 7.85] | 6.00 [5.47, 6.69] | -15.3% |
+| N | async full mutex | async minimal | minimal vs full | pad overlaps (full / minimal) |
+|---|---|---|---|---|
+| 2 | 6.06 [5.96, 6.20] (0 fb) | 4.63 [4.53, 4.81] (0 fb) | -23.5% | 0 / 0 |
+| 3 | 8.60 [7.43, 9.27] (0 fb) | 6.01 [5.65, 6.71] (0 fb) | -28.8% | 0 / 0 |
+| 4 | 11.36 [10.66, 11.83] (0 fb) | 7.69 [6.93, 8.61] (0 fb) | -32.4% | 0 / 0 |
 
-**Executed: the same refined paths, lock-step vs asynchronous.** "fb" counts runs where no
-verified collision-free asynchronous schedule was found, so lock-step was used instead; those runs
-count with their lock-step makespan. The last column is the mean over runs without a fallback.
+The minimal intervals cut the makespan by about a quarter to a third with zero pad overlaps, and
+the gain grows with the number of arms.
 
-| N | lock-step | async, full mutex | async, minimal | async, motion conflict | async minimal vs lock-step |
+**Reference: lock-step**, dRRT*'s own execution. It only avoids collisions and is never given the
+pad mutex, so it can put two arms on the pad at once.
+
+| N | lock-step | lock-step pad overlaps | async minimal vs lock-step | async motion conflict | refined paths tried |
 |---|---|---|---|---|---|
-| 2 | 4.68 [4.59, 4.81] | 6.06 [5.96, 6.20] (0 fb) | 4.63 [4.53, 4.81] (0 fb) | 4.63 [4.53, 4.81] (0 fb) | -1.1% |
-| 3 | 6.26 [6.12, 6.45] | 9.06 [8.79, 9.27] (0 fb) | 5.82 [5.65, 6.12] (1 fb) | 5.93 [5.65, 6.46] (0 fb) | -10.4% |
-| 4 | 7.39 [7.15, 7.66] | 11.35 [10.66, 11.81] (0 fb) | 7.20 [6.93, 7.53] (1 fb) | 7.20 [6.93, 7.53] (1 fb) | -3.8% |
+| 2 | 4.68 [4.59, 4.81] | 0 of 3 runs | -1.1% | 4.63 [4.53, 4.81] (0 fb) | 1.0 |
+| 3 | 6.49 [6.20, 6.82] | 1 of 3 runs, 1 overlap (1.01 s) | -7.5% | 6.01 [5.65, 6.71] (0 fb) | 1.3 |
+| 4 | 7.78 [7.36, 8.33] | 1 of 3 runs, 1 overlap (0.57 s) | -1.4% | 7.76 [6.93, 8.82] (0 fb) | 1.3 |
 
-How to read this:
+On average, async minimal is as fast as lock-step or slightly faster. It never violates the pad
+mutex, while lock-step violated it in 2 of these 9 runs.
 
-- The schedule-level gain of the minimal intervals over a whole-action mutex is consistent, and
-  grows with N.
-- On the executed paths, asynchronous minimal always beats asynchronous full serialization.
-- Against lock-step, asynchronous minimal helps clearly at N = 3 (-10.4%), modestly at N = 4
-  (-3.8%) and barely at N = 2 (-1.1%).
-- It still falls back to lock-step in 1 of 3 seeds at both N = 3 and N = 4. At N = 4 (seed 2)
-  the reason is geometric: one arm's resting pose lies in another arm's placement path, and no
-  re-timing of the same paths avoids it. Lock-step avoided it only because that arm happened to
-  be busy at that moment. Lock-step here is dRRT*'s collision-only execution: it is not given the pad
-  mutex, and it prints any pad overlap it has.
+**Planned (Tamer):** minimal is shorter than full mutex at every N: -8.8%, -9.5% and -15.3% for
+N = 2, 3, 4. Planned and executed differ because executed durations come from the real refined
+paths, which are longer than the representative samples Tamer plans with.
+
+How to read the tables:
+
+- **fb (fallback):** no verified collision-free asynchronous schedule was found, so that run
+  executes lock-step and counts with its lock-step makespan and lock-step pad overlaps. No run in
+  this sweep fell back.
+- **async minimal vs lock-step:** the mean over runs without a minimal fallback.
+- **refined paths tried:** each run refines up to 3 paths (`--path_attempts`, a fresh seed each)
+  and keeps the first one whose minimal schedule is verified. N = 3 seed 1 and N = 4 seed 2 needed
+  a second path.
+
+**5 and 6 arms:** `--sweep` accepts N up to 6, but `python demos/demo4.py --sweep 5,6 --seeds 0
+--no_gui` timed out at the 300 s per-run cap for both N = 5 and N = 6 (`--run_timeout` raises the
+cap). The sweep reports such runs and leaves them out of the "runs" count. With this
+single-shared-pad layout, results are only available up to 4 arms.
