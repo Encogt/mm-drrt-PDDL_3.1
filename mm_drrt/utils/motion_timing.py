@@ -397,6 +397,9 @@ def verify_async(env, execution, dt=0.02, tolerance=None):
                     r = owner_of_frame(robot_frame)
                     if r is None or obj not in blocks or holder.get(obj) == r:
                         continue
+                    own = execution.active(r, t)[0]
+                    if own is not None and execution.timeline[own]['obj'] == obj:
+                        continue  # the block this robot is grasping/placing right now: contact is the point
                     if obj in holder:  # carried by another robot: a robot-robot collision
                         pair = [r, holder[obj]]
                         return float(t), pair, {k: execution.active(k, t)[0] for k in pair}, None
@@ -471,7 +474,7 @@ def _idle_alignment(env, timeline, mover, idle_robot, step=0.04):
         env.restore_world(saved_world)
 
 
-def async_schedule(env, schedule, timeline, conflicts=None, max_rounds=8, dt=0.02):
+def async_schedule(env, schedule, timeline, conflicts=None, max_rounds=12, dt=0.02):
     """Asynchronous re-timing + replanning loop (Step 5a, then verification):
 
       1. re-time the solved schedule (schedule_repair.retime_schedule: same actions, same orders)
@@ -509,9 +512,26 @@ def async_schedule(env, schedule, timeline, conflicts=None, max_rounds=8, dt=0.0
                 conflicts.append((a['name'], b['name'], ta['entry'], ta['exit'], tb['entry'], tb['exit']))
     conflicts = list(conflicts)
     extra = []
+    forced = {}
+    constrained = set()  # pairs that already got a motion-conflict window
     log = []
     for rounds in range(1, max_rounds + 1):
-        result = retime_schedule(sched, {}, durations, conflicts=conflicts, extra=extra)
+        result = retime_schedule(sched, {}, durations, conflicts=conflicts, extra=extra, forced_order=forced)
+        if not result.feasible:
+            # Orders read off the lock-step timeline can contradict each other once several
+            # conflict windows are in play. Flip one pair's order at a time, keeping a flip only if
+            # it restores feasibility.
+            for key in {frozenset((c[0], c[1])) for c in conflicts}:
+                for first_name in key:
+                    trial = {**forced, key: first_name}
+                    r_try = retime_schedule(sched, {}, durations, conflicts=conflicts, extra=extra, forced_order=trial)
+                    if r_try.feasible:
+                        forced, result = trial, r_try
+                        log.append(f"round {rounds}: orders contradicted each other; {first_name} now goes "
+                                   f"first in {'/'.join(sorted(key))}")
+                        break
+                if result.feasible:
+                    break
         if not result.feasible:
             log.append(f"round {rounds}: re-timing infeasible")
             return AsyncResult(False, None, None, None, rounds, conflicts, log)
@@ -534,7 +554,12 @@ def async_schedule(env, schedule, timeline, conflicts=None, max_rounds=8, dt=0.0
             return AsyncResult(False, execution, result.starts, execution.makespan, rounds, conflicts, log)
         if len(movers) == 2:
             pair = {n: timeline[n] for n in movers}
-            found = detect_motion_conflicts(env, pair)
+            key = frozenset(movers)
+            # A pair that collides AGAIN after already getting its conflict window: that window
+            # doesn't cover the real contact (e.g. a carried block, which the arm-only window
+            # check ignores) -- serialize the pair's whole actions instead of re-adding it.
+            found = [] if key in constrained else detect_motion_conflicts(env, pair)
+            constrained.add(key)
             if not found:
                 # The sweep saw a collision the pairwise check didn't (interpolation between
                 # waypoints): fall back to serializing the pair's whole actions.
@@ -543,11 +568,26 @@ def async_schedule(env, schedule, timeline, conflicts=None, max_rounds=8, dt=0.0
                                         timeline[a]['region'], timeline[b]['region'], 0)]
             for c in found:
                 conflicts.append((c.name_i, c.name_j, c.alpha_i, c.beta_i, c.alpha_j, c.beta_j))
+            # The pair's default order (read off the lock-step timeline) can contradict the other
+            # constraints. Before giving up, try both orders and keep the feasible, shorter one.
+            key = frozenset(movers)
+            if not retime_schedule(sched, {}, durations, conflicts=conflicts, extra=extra,
+                                   forced_order=forced).feasible:
+                trials = []
+                for first_name in movers:
+                    trial = {**forced, key: first_name}
+                    r_try = retime_schedule(sched, {}, durations, conflicts=conflicts, extra=extra, forced_order=trial)
+                    if r_try.feasible:
+                        trials.append((r_try.makespan, first_name, trial))
+                if trials:
+                    _, first_name, forced = min(trials, key=lambda x: x[0])
+                    log.append(f"  order of {movers[0]}/{movers[1]} contradicted the other constraints: "
+                               f"{first_name} goes first instead")
         else:
             idle = next(r for r in robots_hit if active[r] is None)
             options = _idle_alignment(env, timeline, movers[0], idle) or []
             chosen = next((o for o in options if retime_schedule(sched, {}, durations, conflicts=conflicts,
-                                                                 extra=extra + o).feasible), None)
+                                                                 extra=extra + o, forced_order=forced).feasible), None)
             if chosen is None:
                 log.append(f"  robot {idle} idles in {movers[0]}'s way and none of its actions can be "
                            f"aligned to clear it")

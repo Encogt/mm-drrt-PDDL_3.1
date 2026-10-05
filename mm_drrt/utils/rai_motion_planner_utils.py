@@ -316,11 +316,14 @@ def replay_composite_path(C, composite_path, joints, release_targets, gripper_fr
 
 
 def replay_timed(C, execution, joints, release_targets, gripper_frames, dt=0.02, speed=1.0,
-                 clock_every=0.5):
+                 clock_every=0.5, caption=None, on_tick=None):
     """Plays an asynchronous execution (motion_timing.AsyncExecution) in the viewer against
     wall-clock time: every robot follows its own timed trajectory, grasping/releasing at its own
     event times -- unlike replay_composite_path, nobody waits at dRRT*'s composite nodes. Prints a
-    running clock with what each robot is doing. speed > 1 plays faster than real time."""
+    running clock with what each robot is doing. speed > 1 plays faster than real time.
+    caption: optional text shown in the viewer with the clock and each robot's current action.
+    on_tick(t): optional callback once per frame, after the scene is updated and before it is
+    drawn (e.g. to recolour a region or pause at a moment of interest)."""
     num_robots = len(joints)
     table_top = _table_top(C)
     for gf in gripper_frames:
@@ -349,11 +352,16 @@ def replay_timed(C, execution, joints, release_targets, gripper_frames, dt=0.02,
             for r in range(num_robots):
                 if attached[r]:
                     _clamp_held_above_table(C, attached[r], table_top)
+        doing = '  '.join(f"r{r}:{execution.active(r, t)[0] or '-'}" for r in range(num_robots))
         if t >= next_clock:
-            doing = '  '.join(f"r{r}:{execution.active(r, t)[0] or '-'}" for r in range(num_robots))
             print(f"  t={t:5.2f}s  {doing}")
             next_clock += clock_every
-        C.view(False)
+        if on_tick is not None:
+            on_tick(t)
+        if caption:
+            C.view(False, f"{caption}   t={t:5.2f}s   {doing}")
+        else:
+            C.view(False)
         time.sleep(dt / speed)
         t += dt
 

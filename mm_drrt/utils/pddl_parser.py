@@ -117,7 +117,7 @@ def parse_pddl_plan(pddl_plan, mapper, env, return_schedule=False):
         # initialize_robot_plans() preserves dict insertion order and
         # individual_path_computation() assumes transit(even) before transfer(odd).
         for i, (start_time, action, duration) in enumerate(
-                sorted(pddl_plan.timed_actions, key=lambda t: t[0])):
+                sorted(pddl_plan.timed_actions, key=lambda t: (t[0], str(t[1])))):  # stable on ties
             action_name = f"a{i}"
             action_info = _parse_action(action, action_name, mapper, start_time, start_time + duration)
             actions_list.append(action_info)

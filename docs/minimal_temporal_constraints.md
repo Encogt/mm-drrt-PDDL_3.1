@@ -289,6 +289,30 @@ as follows:
   the time-aligned poses are clear, and that range becomes two difference constraints.
 - **With a resting block:** reported, and the lock-step execution, which is always valid, is used.
 
+If a pair's default order makes the re-timing infeasible, the other order is tried before giving
+up. If the loop still runs out of options, the lock-step execution is used.
+
+Measured over 3 seeds (full table in `demos/README.md`):
+
+- **Planned:** the minimal intervals beat a whole-action mutex at every N (-8.8%, -9.5% and -15.3%
+  for N = 2, 3, 4).
+- **Executed:** asynchronous minimal beats lock-step by 1.1%, 10.4% and 3.8% at N = 2, 3, 4. It
+  falls back to lock-step in 1 of 3 seeds at N = 3 and at N = 4; at N = 4 the cause is an arm's
+  resting pose lying in another arm's placement path, which no re-timing of the same paths can
+  avoid.
+
+The re-timing loop handles three more cases, each found from the sweep's fallback reasons:
+
+- **Own-block contact:** an arm touching the block it is grasping or placing at that moment is not
+  a collision.
+- **Contradictory starting orders:** when the starting pair orders contradict each other, one
+  pair's order is flipped at a time until the constraints are feasible.
+- **Repeated collision:** a pair that collides again after getting its conflict window (e.g. via
+  a carried block, which that window ignores) is fully serialized.
+
+Runs are reproducible: the demos fix `PYTHONHASHSEED`, since set iteration order over object names
+otherwise changes every random draw downstream.
+
 Grasps and releases, in both the replay and the sweep, happen at the gripper's lowest point inside
 the target region, not at the dRRT* node where the attachment flips. The node can end a few
 waypoints before the arm reaches the place pose.

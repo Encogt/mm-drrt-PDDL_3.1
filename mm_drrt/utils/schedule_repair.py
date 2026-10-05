@@ -150,7 +150,7 @@ def _precedence_constraints(schedule, durations):
     return constraints
 
 
-def _conflict_constraints(schedule, conflicts):
+def _conflict_constraints(schedule, conflicts, forced_order=None):
     """Region constraints from motion-detected conflicts (motion_timing.detect_motion_conflicts):
     each is (name_i, name_j, alpha_i, beta_i, alpha_j, beta_j) for one colliding pair. The order is
     the one the solved schedule already had them entering their conflict windows in; a pair the
@@ -160,7 +160,8 @@ def _conflict_constraints(schedule, conflicts):
     # One order per pair: a pair can carry several conflict windows (e.g. its region window plus a
     # motion-detected one), and deciding each from its own entry time can point them in opposite
     # directions -- a cycle, i.e. a spuriously infeasible re-timing. The pair's first entry wins.
-    first_of = {}
+    # forced_order {frozenset((a, b)): name that goes first} overrides the solved order for a pair.
+    first_of = dict(forced_order or {})
     for name_i, name_j, a_i, b_i, a_j, b_j in conflicts:
         key = frozenset((name_i, name_j))
         if key in first_of:
@@ -183,22 +184,25 @@ def _conflict_constraints(schedule, conflicts):
 
 def _region_constraints(schedule, offsets, order):
     """Region constraints for every pair sharing a region. order='solved' keeps the order the
-    schedule already has; order='minimal' takes derive_minimal_constraint()'s cheaper order -- for
+    schedule already has; order='minimal' takes derive_minimal_constraint()'s cheaper order and
+    order='maximal' the more expensive one (to show what the wrong choice costs) -- for
     two actions with no symbolic link (different robots and objects) the order on a shared region
     is a pure scheduling decision, which a satisficing planner like Tamer need not get right."""
     constraints = []
     for first, second in region_pairs(schedule, offsets):
         a_f, b_f = offsets[first['name']]
         a_s, b_s = offsets[second['name']]
-        if order == 'minimal' and derive_minimal_constraint(a_f, b_f, a_s, b_s).order == 'j_before_i':
-            constraints.append((second['name'], first['name'], b_s - a_f, 'region (minimal order)'))
+        cheaper_is_second_first = derive_minimal_constraint(a_f, b_f, a_s, b_s).order == 'j_before_i'
+        if (order == 'minimal' and cheaper_is_second_first) or \
+                (order == 'maximal' and not cheaper_is_second_first and b_f - a_s != b_s - a_f):
+            constraints.append((second['name'], first['name'], b_s - a_f, f'region ({order} order)'))
         else:
             constraints.append((first['name'], second['name'], b_f - a_s, 'region'))
     return constraints
 
 
 def retime_schedule(schedule, offsets, durations, conflicts=None, max_makespan=None, order='solved',
-                    extra=()):
+                    extra=(), forced_order=None):
     """Earliest start times for the SAME actions, in the SAME per-robot/per-object order -- and,
     with order='solved', the same per-region order -- under new offsets/durations (e.g. measured on
     the executed trajectory).
@@ -217,6 +221,9 @@ def retime_schedule(schedule, offsets, durations, conflicts=None, max_makespan=N
             the same-robot/handoff orders is infeasible; the solved order is then used instead.
         extra: additional raw difference constraints [(u, v, w, kind)] meaning s_v - s_u >= w
             (e.g. motion_timing.async_schedule's alignment constraints for an idle robot).
+        forced_order: {frozenset((a, b)): first} -- the order of a conflict pair, overriding the
+            one read off the schedule (motion_timing.async_schedule flips a pair this way when its
+            default order makes the re-timing infeasible).
 
     Returns RetimeResult: feasible, starts {name: s}, makespan, original_makespan (as solved),
     deltas {name: new s - solved s}, constraints [(pre, post, gap, kind)] used.
@@ -224,7 +231,7 @@ def retime_schedule(schedule, offsets, durations, conflicts=None, max_makespan=N
     precedence = _precedence_constraints(schedule, durations) + list(extra)
     if conflicts is not None:
         return _solve_difference_constraints(schedule, durations, precedence +
-                                             _conflict_constraints(schedule, conflicts), max_makespan)
+                                             _conflict_constraints(schedule, conflicts, forced_order), max_makespan)
     result = _solve_difference_constraints(schedule, durations, precedence +
                                            _region_constraints(schedule, offsets, order), max_makespan)
     if not result.feasible and order != 'solved':
@@ -315,6 +322,12 @@ if __name__ == '__main__':
     r = retime_schedule(sched2, offs2, durs2, order='minimal')
     assert r.feasible and r.starts['a'] == 0.0 and abs(r.starts['b'] - 2.0) < 1e-9, r
     assert abs(r.makespan - 12.0) < 1e-9
+    # order='maximal' always takes the expensive order, whichever one Tamer happened to choose.
+    assert abs(retime_schedule(sched2, offs2, durs2, order='maximal').makespan - 20.0) < 1e-9
+    r = retime_schedule(sched2, offs2, durs2, order='minimal')
+    flipped = [dict(x, start=r.starts[x['name']], occupy_start=r.starts[x['name']] + offs2[x['name']][0])
+               for x in sched2]
+    assert abs(retime_schedule(flipped, offs2, durs2, order='maximal').makespan - 20.0) < 1e-9
 
     # Re-timing with WIDER measured offsets: b must move from 2.01 to 6 - 1 = 5.
     durs = {'a': 10.0, 'b': 10.0}

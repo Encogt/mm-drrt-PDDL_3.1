@@ -28,16 +28,16 @@ import sys
 import numpy as np
 
 from _walkthrough import demo_args, Walkthrough, pipeline_opt, setup_scene, close_scene, gantt, \
-    schedule_rows, replay_sync, table
+    schedule_rows, replay_sync, table, timed_rows, replay_async, occupancy_light
 
-from mm_drrt.pipeline_rai import refine, planner_settings
+from mm_drrt.pipeline_rai import refine, planner_settings, handoff_constraints_only
 from mm_drrt.planner.tamer_pddl_planner import TamerPDDLPlanner, _solve_with_wall_clock_timeout
 from mm_drrt.planner.pddl_problem_generator import generate_problem
 from mm_drrt.utils.schedule_repair import check_least_commitment, is_least_commitment, offsets_by_action, \
     retime_schedule
 from mm_drrt.utils.pddl_parser import parse_pddl_plan
 from mm_drrt.utils.minimal_temporal_constraint import derive_minimal_constraint
-from mm_drrt.utils.motion_timing import velocity_limits
+from mm_drrt.utils.motion_timing import velocity_limits, executed_action_timeline, async_schedule
 from mm_drrt.utils.rai_motion_planner_utils import sample_region_offsets
 from mm_drrt.utils import rai_utils as ru
 
@@ -63,7 +63,8 @@ def pad_overlap(schedule, measured):
 
 
 def main():
-    args = demo_args(__doc__.split('\n')[1])
+    # Slow motion by default: the two coordination rules differ by well under a second.
+    args = demo_args(__doc__.split('\n')[1], lambda parser: parser.set_defaults(speed=0.4))
     w = Walkthrough("Contribution 3 -- least-commitment conflict resolution", not args.no_gui)
     opt = pipeline_opt(w.use_gui, args.seed, '--env_type', 'exp_region_coordination_demo', '--num_robots', '2',
                        '--num_objs', '2', '--use_pddl_planner', '--region_mutex_enabled',
@@ -124,28 +125,81 @@ def main():
               f"the remaining slack is Tamer's 0.01s epsilon separation.")
         w.pause()
 
-        w.step("Refine both constrained plans",
-               """Both go through the unchanged PlanSkeleton/dRRT* refinement and are replayed:
-               first the fully serialized plan, then the minimal one, where the second arm starts
-               its placement while the first is still retreating.""")
-        for s in (full, minimal):
+        w.step("Same motion, two coordination rules",
+               """To make the difference visible, both rules are applied to the SAME refined
+               motion: the minimal plan is refined once by the unchanged PlanSkeleton/dRRT*, and its
+               paths are then timed two ways -- with the pad held for each placement's WHOLE
+               duration (full mutex), and with only the measured occupancy intervals kept apart
+               (minimal). Each timing is swept for collisions before it is used. Watch the second
+               arm: under the full mutex it waits until the first arm has completely finished its
+               placement; under the minimal constraint it starts moving in while the first arm is
+               still retreating.""")
+        env.restore_world(initial_world)
+        random.seed(opt.seed)
+        np.random.seed(opt.seed)
+        plan = minimal['plan']
+        path, secs = refine(env, opt, plan, minimal['obj_orders'],
+                            handoff_constraints_only(plan, minimal['constraints']))
+        print(f"  refined in {secs:.1f}s, {len(path)} composite nodes")
+        timeline = executed_action_timeline(env, path, minimal['action_orders'], plan)
+        sched = minimal['schedule']
+        pad_pairs = [(x['name'], y['name'], 0.0, timeline[x['name']]['duration'], 0.0, timeline[y['name']]['duration'])
+                     for i, x in enumerate(sched) for y in sched[i + 1:]
+                     if x['name'] in timeline and y['name'] in timeline and x['robot'] != y['robot']
+                     and x['region'] == y['region']]
+        timings = []
+        for label, conflicts in (('full mutex (whole placements apart)', pad_pairs),
+                                 ('minimal (only pad occupancy apart)', None)):
+            res = async_schedule(env, sched, timeline, conflicts=conflicts)
+            print()
+            if res.feasible:
+                gantt(timed_rows(timeline, res.starts), title=f"  {label}: makespan {res.makespan:.3f}s")
+                transfers = sorted((res.starts[n], n) for n in timeline if timeline[n]['type'] == 'transfer')
+                print(f"    placements start at {', '.join(f'{n} {t:.2f}s' for t, n in transfers)}")
+            else:
+                print(f"  {label}: no verified collision-free timing ({res.log[-1].strip()})")
+            timings.append((label, res))
+        ok = [(label, res) for label, res in timings if res.feasible]
+        if len(ok) == 2:
+            print(f"\n  Same paths: the minimal constraint finishes {ok[0][1].makespan - ok[1][1].makespan:.3f}s "
+                  f"earlier ({ok[1][1].makespan:.3f}s vs {ok[0][1].makespan:.3f}s).")
+        w.pause()
+        for label, res in ok:
+            if not w.use_gui:
+                continue
             env.restore_world(initial_world)
-            random.seed(opt.seed)
-            np.random.seed(opt.seed)
-            path, secs = refine(env, opt, s['plan'], s['obj_orders'], s['constraints'])
-            print(f"  {s['label']}: refined in {secs:.1f}s, {len(path)} composite nodes")
-            if w.use_gui:
-                env.restore_world(initial_world)
-                w.say(f"Replaying: {s['label']} (the scene is reset to the start first)")
-                replay_sync(C, env, s['plan'], path, w.use_gui, s['action_orders'])
-                w.pause()
+            transfers = sorted((res.starts[n], n) for n in timeline if timeline[n]['type'] == 'transfer')
+            (t1, first_place), (t2, second_place) = transfers[0], transfers[-1]
+            first_end = t1 + timeline[first_place]['duration']
+            w.say(f"""Replaying: {label}, at {args.speed:g}x speed (the scene is reset first). The pad
+                  glows RED while an arm is inside it and GREEN while it is free. The replay
+                  freezes when the second arm starts its placement.""")
+            light = occupancy_light(C, env.f_objs[2], timeline, res.starts)
+            frozen = []
+
+            def tick(t, light=light, t2=t2, second=second_place, first=first_place, first_end=first_end,
+                     frozen=frozen):
+                light(t)
+                if t >= t2 and not frozen:
+                    frozen.append(t)
+                    still = first_end - t
+                    print(f"\n  >>> t={t2:.2f}s: {second} (second arm) starts placing. "
+                          + (f"{first} (first arm) is still moving for another {still:.2f}s -- the two placements overlap."
+                             if still > 0.01 else f"{first} (first arm) finished {-still:.2f}s ago -- it waited for the whole placement."))
+                    w.pause('  (frozen -- press Enter to continue the replay)')
+            replay_async(C, env, plan, res.execution, w.use_gui, speed=args.speed,
+                         caption=label.split(' (')[0], on_tick=tick)
+            w.pause()
 
         w.step("Per-(robot, region) intervals: choosing the cheaper order",
                """With numeric fluents each robot keeps its OWN measured interval for the pad, so
                the two orders cost different amounts: i-before-j needs beta_i - alpha_j,
                j-before-i needs beta_j - alpha_i. derive_minimal_constraint() says which is
-               cheaper; Tamer's solved order is checked against it.""")
+               cheaper. Both orders' schedules are shown below, then Tamer's own choice is
+               checked against them.""")
         env.restore_world(initial_world)
+        random.seed(opt.seed)  # the same per-robot samples every run, whatever came before
+        np.random.seed(opt.seed)
         per_robot = {}
         for r, key in ((0, 'r0'), (1, 'r1')):
             robot = env.robots[r]
@@ -176,21 +230,28 @@ def main():
               f"-> cheaper: {cheaper} first")
         gantt(schedule_rows(env, schedule), title=f"  Tamer's schedule ({first['robot']} first):")
         [c] = check_least_commitment(schedule, offsets)
+        durs = {a['name']: duration for a in schedule}
+
+        def retimed_rows(result):
+            return [dict(a, start=result.starts[a['name']], end=result.starts[a['name']] + durs[a['name']],
+                         occupy_start=result.starts[a['name']] + offsets[a['name']][0],
+                         occupy_end=result.starts[a['name']] + offsets[a['name']][1]) for a in schedule]
+        minimal_r = retime_schedule(schedule, offsets, durs, order='minimal')
+        maximal_r = retime_schedule(schedule, offsets, durs, order='maximal')
+        other = 'r1' if cheaper == 'r0' else 'r0'
+        print()
+        gantt(schedule_rows(env, retimed_rows(minimal_r)), title=f"  cheaper order ({cheaper} first): makespan {minimal_r.makespan:.3f}s")
+        gantt(schedule_rows(env, retimed_rows(maximal_r)), title=f"  other order ({other} first): makespan {maximal_r.makespan:.3f}s")
+        print(f"\n  Picking the cheaper order saves {maximal_r.makespan - minimal_r.makespan:.3f}s here.")
         if c.minimal_order_chosen:
-            print(f"  Tamer chose the cheaper order (gap {c.actual_gap:.3f}s vs minimum {c.minimal_gap:.3f}s).")
+            print(f"  Tamer chose the cheaper order itself ({first['robot']} first; gap {c.actual_gap:.3f}s vs "
+                  f"minimum {c.minimal_gap:.3f}s): nothing to repair this time.")
         else:
-            w.say(f"""Tamer chose the MORE expensive order: it is a satisficing planner and does not
-                  optimize makespan. The two placements share no robot or object, so their order
-                  on the pad is a pure scheduling decision, and re-timing with
-                  derive_minimal_constraint()'s order fixes it without touching the plan:""")
-            durs = {a['name']: duration for a in schedule}
-            solved_r = retime_schedule(schedule, offsets, durs)
-            minimal_r = retime_schedule(schedule, offsets, durs, order='minimal')
-            retimed = [dict(a, start=minimal_r.starts[a['name']], end=minimal_r.starts[a['name']] + durs[a['name']],
-                            occupy_start=minimal_r.starts[a['name']] + offsets[a['name']][0],
-                            occupy_end=minimal_r.starts[a['name']] + offsets[a['name']][1]) for a in schedule]
-            gantt(schedule_rows(env, retimed), title=f"  re-timed with the minimal order ({cheaper} first):")
-            print(f"  makespan {solved_r.makespan:.3f}s (Tamer's order) -> {minimal_r.makespan:.3f}s (minimal order)")
+            w.say(f"""Tamer chose the MORE expensive order ({first['robot']} first): it is a satisficing
+                  planner and does not optimize makespan. The two placements share no robot or
+                  object, so their order on the pad is a pure scheduling decision, and re-timing with
+                  derive_minimal_constraint()'s order gives the cheaper schedule above without
+                  touching the plan.""")
         w.pause()
 
         w.step("Summary",

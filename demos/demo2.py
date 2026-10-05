@@ -70,10 +70,10 @@ def main():
     opt = pipeline_opt(w.use_gui, args.seed, '--env_type', 'exp_region_coordination_demo', '--num_robots', '2',
                        '--num_objs', '2', '--use_pddl_planner', '--region_mutex_enabled',
                        '--region_offsets_from_motion', '--durations_from_motion', '--region_offset_mode', 'two',
-                       '--repair_strategy', 'resolve', '--max_resolve_attempts', '2', '--no_offsets_cache',
-                       # A tight tolerance so a 0.1 s planned/executed mismatch already counts:
-                       # the repair loop is what this step demonstrates.
-                       '--repair_tolerance', '0.05')
+                       '--repair_strategy', 'resolve', '--max_resolve_attempts', '2', '--no_offsets_cache')
+    # Step 5 runs the arms slower than the planner's model (see there); everything before it
+    # measures with the model itself.
+    exec_scale = 0.6
     C, env = setup_scene(opt)
     try:
         w.step("Scenario and what is being measured",
@@ -164,11 +164,17 @@ def main():
                plan. The executed per-robot trajectories are then split into actions and measured
                exactly the same way. A representative sample is not the trajectory dRRT* actually
                produces, so planned and executed timing can disagree; when the executed motion
-               leaves its planned window or takes longer -- by more than 0.05 s here, deliberately
-               tight -- the intervals/durations are widened and the plan is re-solved (up to 2
-               times).""")
+               leaves its planned window or takes longer (beyond a 0.5 s tolerance), the
+               intervals/durations are widened and the plan is re-solved (up to 2 times).
+
+               To make the disagreement real and visible, the arms here EXECUTE at 60% of the joint
+               speed the planner modelled -- a model mismatch, as when a real controller runs
+               slower than the nominal limits. Every executed motion then takes longer and leaves
+               its region later than planned: the planned windows are genuinely too narrow, and
+               the loop has to fix them.""")
         random.seed(opt.seed)
         np.random.seed(opt.seed)
+        opt.execution_velocity_scale = exec_scale
         result = pipeline_rai.run_pipeline(env, opt, planned, 'demo2')
         print(f"\n  attempts: {result.attempts}")
         if result.timeline:

@@ -84,6 +84,7 @@ def build_parser():
     # uses the measured durations as the PDDL :duration of transit/transfer.
     parser.add_argument('--durations_from_motion', action='store_true', help='With --region_offsets_from_motion: also take transit/transfer durations from the measured motion, and measure alpha/beta in seconds of velocity-limited motion instead of index fractions of --*_duration')
     parser.add_argument('--joint_velocity_scale', type=float, default=1.0, help='Fraction of the joint velocity limits motion timing assumes execution runs at')
+    parser.add_argument('--execution_velocity_scale', type=float, default=None, help='Fraction of the joint velocity limits the arms REALLY execute at, used to time the executed trajectory (default: --joint_velocity_scale, i.e. execution matches the planning model). A lower value models arms running slower than the planner assumed')
     # Temporal repair after refinement (docs/minimal_temporal_constraints.md, Step 5).
     parser.add_argument('--repair_strategy', type=str, default='retime', choices=['report', 'retime', 'resolve'], help='On a repair violation: report only (widen + cache for future runs); retime the existing plan without re-planning (Step 5a), falling back to resolve if infeasible; or resolve: widen offsets and re-run Tamer + refinement (Step 5b)')
     parser.add_argument('--max_resolve_attempts', type=int, default=2, help='Cap on Step 5b re-solves within one run')
@@ -341,8 +342,9 @@ def measure_executed(env, opt, composite_path, plan, action_orders, durations):
     stay comparable with measure_region_offsets()'s planned values."""
     timeline = None
     try:
-        timeline = executed_action_timeline(env, composite_path, action_orders, plan,
-                                            vel_scale=opt.joint_velocity_scale)
+        exec_scale = opt.execution_velocity_scale if opt.execution_velocity_scale is not None \
+            else opt.joint_velocity_scale
+        timeline = executed_action_timeline(env, composite_path, action_orders, plan, vel_scale=exec_scale)
     except Exception as e:  # best-effort, like measure_executed_region_offsets
         print(f"Note: could not build the executed timeline: {type(e).__name__}: {e}")
     if opt.durations_from_motion:
@@ -368,14 +370,22 @@ def repair_offsets(opt, planned, effective, durations, executed):
         result = repair_region_offsets(pa, pb, ma, mb, tolerance=opt.repair_tolerance)
         violated = result.violated
         detail = f"(entry_diff={result.entry_diff:+.3f}, exit_diff={result.exit_diff:+.3f})"
+        # Only the dangerous directions count: entering earlier, leaving later, or taking longer
+        # than the schedule assumed. Entering later / leaving earlier is inside the window.
+        reasons = []
+        if result.entry_diff < -opt.repair_tolerance:
+            reasons.append('entered the region EARLIER than planned')
+        if result.exit_diff > opt.repair_tolerance:
+            reasons.append('left the region LATER than planned')
         if opt.durations_from_motion:
             pd, md = durations[action_type], measured_exec[2]
-            # Taking longer than scheduled is the dangerous direction, same as exiting later.
-            violated = violated or md - pd > opt.repair_tolerance
+            if md - pd > opt.repair_tolerance:
+                reasons.append('took LONGER than planned')
+                violated = True
             detail += f" duration planned={pd:.3f} measured={md:.3f}"
         repaired[action_type] = widen(planned[action_type], measured_exec)
         print(f"  {action_type}: planned=({pa:.3f},{pb:.3f}) measured=({ma:.3f},{mb:.3f}) "
-              f"-> {'VIOLATED' if violated else 'ok'}  {detail}")
+              f"-> {'VIOLATED: ' + ', '.join(reasons) if violated else 'ok'}  {detail}")
         any_violation = any_violation or violated
     return repaired, any_violation
 

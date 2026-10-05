@@ -22,11 +22,12 @@ conflict interval and the schedule is re-timed (the asynchronous replanning loop
 Usage:
     python demos/demo4.py                   # GUI walkthrough, N = 3
     python demos/demo4.py --num_robots 4    # GUI walkthrough, N = 4 (refinement ~1-2 min)
-    python demos/demo4.py --sweep 2,3       # headless scaling table
+    python demos/demo4.py --sweep 2,3,4 --seeds 0,1,2   # headless multi-seed scaling table
 
 Each N runs in under 5 minutes headless (N = 4 is the slow one: up to 2 dRRT* attempts of 60 s).
 """
 import random
+import sys
 import time
 
 import numpy as np
@@ -44,6 +45,9 @@ from mm_drrt.utils.motion_timing import executed_action_timeline, lockstep_makes
 def extra_args(parser):
     parser.add_argument('--num_robots', type=int, default=3)
     parser.add_argument('--sweep', type=str, default=None, help='Comma-separated N values, e.g. 2,3,4 (headless)')
+    parser.add_argument('--seeds', type=str, default='0', help='With --sweep: comma-separated seeds, e.g. 0,1,2')
+    parser.add_argument('--run_timeout', type=int, default=300, help='With --sweep: wall-clock cap (s) per (N, seed) run')
+    parser.add_argument('--json', type=str, default=None, help='Write this run\'s results to a JSON file (used by --sweep)')
     parser.add_argument('--drrt_time_limit', type=int, default=60,
                         help='dRRT* time limit (s) per refinement attempt')
     parser.add_argument('--refine_attempts', type=int, default=2,
@@ -190,7 +194,8 @@ def run(n, args, w):
                 print(f"    pad occupancy overlaps: {', '.join(f'{a}/{b} {d:.2f}s' for a, b, d in ov) or 'none'}")
             else:
                 print(f"  async, {label}: no verified collision-free re-timing -> falls back to lock-step "
-                      f"execution ({sync:.3f}s)")
+                      f"execution ({sync:.3f}s). Why: {res.log[-1].strip()}")
+                out[key + '_why'] = res.log[-1].strip()
             for line in res.log[:-1]:
                 print(f"    {line}")
         w.pause()
@@ -227,33 +232,88 @@ def run(n, args, w):
         close_scene(C)
 
 
+def sweep(args, ns, seeds):
+    """Every (N, seed) as its own headless subprocess with its own wall-clock cap, so one dRRT*
+    stall or crash only loses that run. Prints per-N mean [min, max] and fallback counts."""
+    import json, os, subprocess, tempfile
+    runs = {}
+    for n in ns:
+        for seed in seeds:
+            out = os.path.join(tempfile.mkdtemp(prefix='demo4_'), 'result.json')
+            cmd = [sys.executable, os.path.abspath(__file__), '--no_gui', '--num_robots', str(n), '--seed', str(seed),
+                   '--drrt_time_limit', str(args.drrt_time_limit), '--refine_attempts', str(args.refine_attempts),
+                   '--json', out]
+            start = time.time()
+            try:
+                subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=args.run_timeout)
+                status = 'ok' if os.path.exists(out) else 'failed'
+            except subprocess.TimeoutExpired:
+                status = 'timeout'
+            r = json.load(open(out)) if status == 'ok' else {}
+            r['status'] = status
+            runs[(n, seed)] = r
+            print(f"  N={n} seed={seed}: {status} in {time.time() - start:.0f}s"
+                  + (f"  plan full/min {r['plan_full']:.2f}/{r['plan_min']:.2f}  lock-step {r['lockstep']:.2f}  "
+                     f"async min {r['async_min']:.2f}{'*' if r.get('async_min_fallback') else ''}"
+                     if status == 'ok' and 'lockstep' in r else ''), flush=True)
+
+    def stat(vals):
+        vals = [v for v in vals if v is not None]
+        if not vals:
+            return '-'
+        return f"{np.mean(vals):.2f} [{min(vals):.2f}, {max(vals):.2f}]" if len(vals) > 1 else f"{vals[0]:.2f}"
+    print("\nPlanned (Tamer, representative durations) -- full mutex vs minimal intervals:")
+    rows = []
+    for n in ns:
+        ok = [runs[(n, s_)] for s_ in seeds if runs[(n, s_)]['status'] == 'ok' and 'plan_full' in runs[(n, s_)]]
+        gain = [100 * (r['plan_min'] / r['plan_full'] - 1) for r in ok]
+        rows.append((n, f"{len(ok)}/{len(seeds)}", stat([r['plan_full'] for r in ok]), stat([r['plan_min'] for r in ok]),
+                     f"{np.mean(gain):+.1f}%" if gain else '-'))
+    table(['N', 'runs', 'full mutex', 'minimal', 'minimal vs full'], rows)
+    print("\nExecuted (same refined paths) -- lock-step vs asynchronous:")
+    rows = []
+    for n in ns:
+        ok = [runs[(n, s_)] for s_ in seeds if runs[(n, s_)]['status'] == 'ok' and 'lockstep' in runs[(n, s_)]]
+        fb = lambda k: sum(1 for r in ok if r.get(k + '_fallback'))
+        gain = [100 * (r['async_min'] / r['lockstep'] - 1) for r in ok if not r.get('async_min_fallback')]
+        rows.append((n, f"{len(ok)}/{len(seeds)}", stat([r['lockstep'] for r in ok]),
+                     f"{stat([r['async_full'] for r in ok])} ({fb('async_full')} fb)",
+                     f"{stat([r['async_min'] for r in ok])} ({fb('async_min')} fb)",
+                     f"{stat([r['async_motion'] for r in ok])} ({fb('async_motion')} fb)",
+                     f"{np.mean(gain):+.1f}%" if gain else '-'))
+    table(['N', 'runs', 'lock-step', 'async full', 'async min', 'async motion', 'async min vs lock-step*'], rows)
+    print("  fb = runs where no verified asynchronous schedule was found and lock-step was used instead"
+          " (those runs count with their lock-step makespan).\n  * mean over runs without a fallback.")
+
+
 def main():
     args = demo_args(__doc__.split('\n')[1], extra_args)
-    sweep = [int(x) for x in args.sweep.split(',')] if args.sweep else None
-    if sweep:
-        args.no_gui = True
+    if args.sweep:
+        sweep(args, [int(x) for x in args.sweep.split(',')], [int(x) for x in args.seeds.split(',')])
+        return
     w = Walkthrough("Contribution 4 -- asynchronous refinement and replanning: makespan and scalability",
                     not args.no_gui)
-    results = []
-    for n in (sweep or [args.num_robots]):
-        try:
-            results.append(run(n, args, w))
-        except SystemExit as e:  # dRRT* raises SystemExit on its time limit
-            print(f"\n  N = {n}: {e}")
-            results.append({'N': n})
-    w.step("Scaling summary" if sweep else "Summary",
+    try:
+        result = run(args.num_robots, args, w)
+    except SystemExit as e:  # dRRT* raises SystemExit on its time limit
+        print(f"\n  N = {args.num_robots}: {e}")
+        result = {'N': args.num_robots}
+    if args.json:
+        import json
+        with open(args.json, 'w') as f:
+            json.dump({k: (float(v) if isinstance(v, (float, np.floating)) else v) for k, v in result.items()}, f)
+    w.step("Summary",
            """Makespans in seconds of velocity-limited motion. 'plan' columns are Tamer's schedules
            (with representative durations); the rest execute the same refined paths.""")
     fmt = lambda v: f"{v:.2f}" if isinstance(v, float) else '-'
     fb = lambda r, k: (fmt(r.get(k)) + ('*' if r.get(k + '_fallback') else ''))
+    r = result
     table(['N', 'Tamer s (min)', 'refine s', 'plan full', 'plan min', 'lock-step', 'async full', 'async min',
-           'async motion', 'best async vs lock-step'],
+           'async motion', 'async min vs lock-step'],
           [(r['N'], fmt(r.get('tamer_min')), fmt(r.get('refine')), fmt(r.get('plan_full')), fmt(r.get('plan_min')),
             fmt(r.get('lockstep')), fb(r, 'async_full'), fb(r, 'async_min'), fb(r, 'async_motion'),
-            (f"{100 * (min(v for v in (r.get('async_min'), r.get('async_motion')) if v) / r['lockstep'] - 1):+.1f}%"
-             if r.get('lockstep') and (r.get('async_min') or r.get('async_motion')) else '-'))
-           for r in results])
-    if any(r.get(k + '_fallback') for r in results for k in ('async_full', 'async_min', 'async_motion')):
+            f"{100 * (r['async_min'] / r['lockstep'] - 1):+.1f}%" if r.get('lockstep') and r.get('async_min') else '-')])
+    if any(r.get(k + '_fallback') for k in ('async_full', 'async_min', 'async_motion')):
         print("  * no verified collision-free asynchronous schedule; the lock-step execution is used instead")
 
 

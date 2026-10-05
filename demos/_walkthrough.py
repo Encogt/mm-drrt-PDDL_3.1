@@ -5,6 +5,12 @@ import argparse
 import os
 import random
 import sys
+
+# Python randomises string hashing per process, so sets of object names iterate in a different
+# order every run -- which shifts every random draw downstream (placements, IK, dRRT*) and makes
+# the same --seed give different plans and numbers. Re-launch once with a fixed hash seed.
+if os.environ.get('PYTHONHASHSEED') != '0':
+    os.execve(sys.executable, [sys.executable] + sys.argv, dict(os.environ, PYTHONHASHSEED='0'))
 import time
 import textwrap
 
@@ -176,12 +182,34 @@ def replay_sync(C, env, plan, composite_path, use_gui, action_orders=None):
     print(f"  (lock-step replay took {time.time() - start:.1f}s wall-clock)")
 
 
-def replay_async(C, env, plan, execution, use_gui, speed=1.0):
+def replay_async(C, env, plan, execution, use_gui, speed=1.0, caption=None, on_tick=None):
     if not use_gui:
         return
     robots = list(env.robots.values())
     release_targets, gripper_frames = release_targets_and_grippers(env, plan)
-    replay_timed(C, execution, env.get_joints(robots), release_targets, gripper_frames, speed=speed)
+    replay_timed(C, execution, env.get_joints(robots), release_targets, gripper_frames, speed=speed,
+                 caption=caption, on_tick=on_tick)
+
+
+def occupancy_light(C, frame, timeline, starts, use_gui=True):
+    """on_tick callback for replay_timed: colours `frame`'s region volume (show_region) red while
+    any action that occupies that region is inside it (its measured [entry, exit] at this
+    execution's start times), green while the region is free."""
+    show_region(C, frame, color=(0.1, 0.8, 0.1), use_gui=use_gui)
+    box = C.getFrame(f'region_volume_{frame}')
+    windows = [(starts[n] + a['entry'], starts[n] + a['exit']) for n, a in timeline.items()
+               if a['region'] == frame and a['entry'] is not None]
+
+    state = [None]
+
+    def tick(t):
+        busy = any(lo <= t <= hi for lo, hi in windows)
+        if busy != state[0]:  # only on a switch: re-copying meshes every frame is slow
+            state[0] = busy
+            box.setColor([0.9, 0.1, 0.1, 0.45] if busy else [0.1, 0.8, 0.1, 0.25])
+            if use_gui:
+                C.view_recopyMeshes()
+    return tick
 
 
 def table(headers, rows):
