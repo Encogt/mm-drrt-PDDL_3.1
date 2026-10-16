@@ -1,0 +1,564 @@
+#!/usr/bin/env python
+"""RAI dual-Franka-arm scenario built to demonstrate what a WRONG PDDL action :duration causes.
+
+Same 'scenarios/pandasTable.g' dual-arm table as example_two_robots_rai_env.py, but with a
+layout that isolates a specific gap: 2 blocks, one per robot, each starting in its own zone
+(zone_left / zone_right) and independently delivered onto ONE shared drop_pad both arms can
+reach. Unlike example_two_robots_rai_env.py's relay/handoff scenarios, the two robots' action
+chains share NO object -- so there is no same-object causal dependency linking them.
+
+mm_drrt.utils.pddl_parser.extract_sequential_constraints only derives cross-robot ordering from
+same-object handoffs (robot A transfers object O, robot B later transits the SAME O). It has no
+way to infer that robot0's transfer-to-drop_pad and robot1's transfer-to-drop_pad need to be kept
+apart, because no object links them. That's true regardless of the PDDL :duration value used --
+create_pddl_problem() below reuses the stock mm_drrt_manipulation domain unmodified and is
+solvable by Tamer as-is.
+
+create_plan_order_constraints() is the SAFE, manually-authored baseline: it adds the missing
+cross-robot ordering by hand (robot1 doesn't even start until robot0's transfer to drop_pad is
+done), exactly the kind of constraint a human engineer has to add because the automatic
+extractor can't infer it. Run normally (through main_rai.py's default PlanSkeleton/dRRT*
+pipeline), this environment is always safe -- dRRT*'s inter_robots_collision_fn
+(rai_drrt_star.py) also independently guarantees no arm-arm collision regardless of what any
+:duration says.
+
+mm_drrt/utils/naive_duration_executor.py is what actually makes a wrong :duration visible: it
+reuses this same environment and plan, but replaces dRRT*'s real inter-robot collision check
+with a naive "wait out the other robot's DECLARED duration, then go" scheduler -- a common
+real-world simplification. An under-estimated --transfer_duration then lets robot1 start into
+drop_pad's airspace before robot0's arm has actually retreated, producing a real, detected
+arm-arm collision.
+"""
+import itertools
+
+import robotic as ry
+
+from mm_drrt.utils import rai_utils as ru
+from mm_drrt.utils.rai_motion_planner_utils import get_placement_gen, \
+    get_grasp_gen, get_gripper, arm_retrieval_motion, get_arm_motion_fn, get_trivial_roadmap, \
+    get_fixed_arm_pick_place_ik_gen
+
+from examples.rai_utils import Environment, create_box
+
+
+BLOCK = (0.05, 0.05, 0.05)
+DurationConflictRaiCameraSetup = [(0, -1, 4), (0, 0, 0)]
+
+_copy_counter = itertools.count()
+
+# Same pad convention as the other RAI envs: thin, non-collidable marker frames on top of the
+# real, contact-enabled 'table' frame (pandasTable.g) -- the table itself is the only real
+# collision geometry for the tabletop.
+#
+# ZONE_SIZE/PAD_SIZE/ZONE_X/PAD_X/SURFACE_Y/SURFACE_Z below are also mirrored in
+# mm_drrt/utils/coordination_regions.g -- update both.
+ZONE_SIZE = (0.3, 0.3, 0.02)
+# Deliberately small (vs. the 0.3x0.3 zones): sample_placement()'s jitter margin (rai_utils.py)
+# only leaves ~3.5cm of room per block on this footprint, so the two independently-sampled
+# placements always land close together on the pad -- forcing the two arms' independently
+# planned approach/retrieval paths to genuinely contest the same small volume, which is what
+# lets naive_duration_executor.py's naive timeline actually observe a real arm-arm collision
+# instead of the two robots just missing each other by chance.
+PAD_SIZE = (0.20, 0.10, 0.02)
+ZONE_X = {'left': -0.8, 'right': 0.8}
+PAD_X = 0.0
+SURFACE_Y = 0.15
+SURFACE_Z = 0.6
+
+
+class DurationConflictRaiEnvironment(Environment):
+    # Minimum gap (m) between two placed blocks. 0 here on purpose: this scenario WANTS the two
+    # placements close together (see PAD_SIZE). A gap of 0 lets blocks touch, though, and then the
+    # fingers holding the second block can clip the first (observed: 1.8 cm in a replay) -- the
+    # demo subclasses below ask for room for the fingers.
+    PLACEMENT_CLEARANCE = 0.0
+
+    def __init__(self, num_robots, num_objs, arm, grasp_type, sim_id, seed):
+        super().__init__(num_objs, seed)
+        if num_robots != 2 or num_objs != 2:
+            raise Exception("This scenario supports exactly 2 robots and 2 objects "
+                            "(one block per robot, both delivered to the shared drop_pad).")
+        self._num_robots = num_robots
+        self._num_m_objs = num_objs
+        self._C = sim_id
+        self._grippers = {}
+        self._grasp_type = grasp_type
+        self._initialize(arm)
+
+    def _initialize(self, arm):
+        self._arm = arm
+        self._create_problem()
+        self.grasp_gen_fn = get_grasp_gen(self._grasp_type, collisions=True)
+        self.placement_gen_fn = get_placement_gen(self._C)
+
+    def placement_sample(self, m_objs, f_obj, num_samples):
+        placement_gen = self.placement_gen_fn(m_objs, f_obj)
+        placements = []
+        for _ in range(num_samples):
+            (p,) = next(placement_gen)
+            placements.append(p)
+        return placements
+
+    def is_placement_collision(self, objs_poses, stationary_m_objs,
+                               remove_m_objs, add_m_objs, remove_then_add_m_objs, add_then_remove_m_objs):
+        for p in objs_poses:
+            p.assign()
+
+        new_placements = remove_then_add_m_objs + add_then_remove_m_objs + add_m_objs
+        for i in range(len(new_placements) - 1):
+            for j in range(i + 1, len(new_placements)):
+                if ru.boxes_overlap(self._C, new_placements[i], new_placements[j], margin=self.PLACEMENT_CLEARANCE):
+                    return False, []
+
+        for add_m_obj in remove_then_add_m_objs + add_then_remove_m_objs + add_m_objs:
+            if any(ru.boxes_overlap(self._C, add_m_obj, obst, margin=self.PLACEMENT_CLEARANCE)
+                   for obst in stationary_m_objs):
+                return False, []
+
+        collisions = []
+        for add_m_obj in remove_then_add_m_objs + add_m_objs:
+            for remove_m_obj in remove_m_objs + add_then_remove_m_objs:
+                if ru.boxes_overlap(self._C, add_m_obj, remove_m_obj):
+                    collisions.append((add_m_obj, remove_m_obj))
+        return True, collisions
+
+    def placement_collision_with_remove_then_add_m_objs(self, init_obj_pose, cur_obj_pose,
+                                                        remove_then_add_m_obj_id, remove_then_add_m_obj,
+                                                        init_collisions, add_m_objs, add_then_remove_m_objs,
+                                                        remove_then_add_m_objs):
+        init_obj_pose.assign()
+        for id, add_m_obj in enumerate(remove_then_add_m_objs + add_then_remove_m_objs + add_m_objs):
+            if id == remove_then_add_m_obj_id:
+                continue
+            if ru.boxes_overlap(self._C, add_m_obj, remove_then_add_m_obj):
+                init_collisions.append((add_m_obj, remove_then_add_m_obj))
+        cur_obj_pose.assign()
+        return init_collisions
+
+    def subgoal_sampling(self, robot, obj_orders, actions, action, m_obj, start_obstacles, goal_obstacles,
+                         custom_limits={}, use_debug=False):
+        self._park_other_arms(robot)
+        pick_place_ik_fn = get_fixed_arm_pick_place_ik_gen(
+            robot, max_attempts=25,
+            start_collision_objs=start_obstacles['objs'] + self.fixed_obstacles,
+            goal_collision_objs=goal_obstacles['objs'] + self.fixed_obstacles,
+            custom_limits=custom_limits.get(robot, {}), use_debug=use_debug)
+        self._assign_target_obj_pose(actions, obj_orders, m_obj, action)
+        start_obj_pose = ru.Pose(self._C, m_obj)
+        grasps = list(self.grasp_gen_fn(robot, m_obj))
+
+        for grasp in grasps:
+            (g,) = grasp
+            output = next(pick_place_ik_fn(self._arm, m_obj, start_obj_pose, g, action.goal['place'],
+                                           start_obst_poses=start_obstacles['poses'],
+                                           goal_obst_poses=goal_obstacles['poses']), None)
+            if output:
+                pick_output, place_output = output
+                action.start['grasp'] = g
+                action.start['place'] = start_obj_pose
+                action.start['base'] = pick_output[0]
+                action.start['approach_conf'] = pick_output[1]
+                action.start['grasp_conf'] = pick_output[2]
+                action.goal['grasp'] = g
+                action.goal['base'] = place_output[0]
+                action.goal['approach_conf'] = place_output[1]
+                action.goal['grasp_conf'] = place_output[2]
+                return True
+        return False
+
+    def compute_path(self, robot, action, m_obj, num_base_samples, num_arm_samples, type=None, use_debug=False):
+        if type == 'return':
+            return True, [], []
+        self._park_other_arms(robot)
+
+        start_obstacles = action.obstacles['start']
+        goal_obstacles = action.obstacles['goal']
+        obstacles = set(start_obstacles['objs']) | set(goal_obstacles['objs'])
+        for obst_pose in start_obstacles['poses']:
+            obst_pose.assign()
+        copied_objs = []
+        if type == 'transfer':
+            copied_objs_poses = []
+            # Every goal obstacle -- another block that will rest on the destination -- gets a copy
+            # at that resting pose; the block itself stays an obstacle where it is now. Copying
+            # only blocks that were ALSO start obstacles left the others at their current pose
+            # (still in their zone), so a placement was planned straight through a block another
+            # arm had already put on the pad (observed: a wrist 4 cm into it with 3 arms).
+            for id in range(len(goal_obstacles['objs'])):
+                name = 'copied_box_{}'.format(next(_copy_counter))
+                create_box(self._C, name, (0, 0, -5), BLOCK)
+                copied_objs.append(name)
+                copied_objs_poses.append(goal_obstacles['poses'][id].value)
+            for id in range(len(copied_objs)):
+                ru.Pose(self._C, copied_objs[id], copied_objs_poses[id], action.to_f_obj).assign()
+            obstacles = obstacles | set(copied_objs)
+        obstacles = list(obstacles) + self.fixed_obstacles
+
+        arm_motion_fn = get_arm_motion_fn(robot, collision_objs=obstacles, num_samples=num_arm_samples,
+                                          expand_type=None, expand_configs=(), use_debug=use_debug)
+
+        max_attempts = 5
+        if type == 'transit':  # pick
+            action.start['place'].assign()
+            attempts = 0
+            while True:
+                arm_approach_roadmap, arm_approach_heuristic_val = arm_motion_fn(
+                    self._arm, m_obj, action.goal['grasp'], action.goal['approach_conf'], action.goal['grasp_conf'])
+                if arm_approach_roadmap is not None:
+                    break
+                attempts += 1
+                if attempts >= max_attempts:
+                    return False, [], []
+            action.goal['grasp'].attach(self._C, gripper_frame=robot.spec.gripper_frame)
+            attempts = 0
+            while True:
+                arm_retrieval_roadmap, arm_retrieval_heuristic_val = arm_retrieval_motion(
+                    robot, self._arm, type, grasp=action.goal['grasp'],
+                    start=arm_approach_roadmap.final_conf, goal=robot.spec.carry_conf,
+                    obstacles=obstacles, attachments=[m_obj], num_samples=num_arm_samples,
+                    expand_type=None, expand_configs=(), use_debug=use_debug)
+                if arm_retrieval_roadmap is not None:
+                    break
+                attempts += 1
+                if attempts >= max_attempts:
+                    return False, [], []
+        else:  # 'transfer' -- place
+            attempts = 0
+            while True:
+                arm_approach_roadmap, arm_approach_heuristic_val = arm_motion_fn(
+                    self._arm, m_obj, action.goal['grasp'], action.goal['approach_conf'], action.goal['grasp_conf'],
+                    attachments=[m_obj])
+                if arm_approach_roadmap is not None:
+                    break
+                attempts += 1
+                if attempts >= max_attempts:
+                    for copied_obj in copied_objs:
+                        ru.remove_frame(self._C, copied_obj)
+                    return False, [], []
+            action.goal['grasp'].detach(self._C, action.to_f_obj)
+            attempts = 0
+            while True:
+                arm_retrieval_roadmap, arm_retrieval_heuristic_val = arm_retrieval_motion(
+                    robot, self._arm, type, grasp=action.goal['grasp'],
+                    start=arm_approach_roadmap.final_conf, goal=robot.spec.carry_conf,
+                    obstacles=obstacles, num_samples=num_arm_samples,
+                    expand_type=None, expand_configs=(), use_debug=use_debug)
+                if arm_retrieval_roadmap is not None:
+                    break
+                attempts += 1
+                if attempts >= max_attempts:
+                    for copied_obj in copied_objs:
+                        ru.remove_frame(self._C, copied_obj)
+                    return False, [], []
+
+        for copied_obj in copied_objs:
+            ru.remove_frame(self._C, copied_obj)
+        trivial_attachments = [m_obj] if type == 'transfer' else []
+        base_roadmap, base_heuristic_val = get_trivial_roadmap(robot.spec.carry_conf, attachments=trivial_attachments)
+        return True, [base_roadmap, arm_approach_roadmap, arm_retrieval_roadmap], \
+               [base_heuristic_val, arm_approach_heuristic_val, arm_retrieval_heuristic_val]
+
+    def _park_other_arms(self, robot):
+        """Every other arm back at its carry_conf before planning one arm's grasps/paths. Each
+        arm's own planning checks it against the others' CURRENT poses, and subgoal sampling leaves
+        each arm at its last IK solution -- over the shared pad -- so later arms' IK collided with
+        earlier arms' leftover poses (with 4 arms, every attempt failed). Arm-vs-arm conflicts
+        are dRRT*'s job; individual planning assumes the others parked."""
+        for other in self.robots.values():
+            if other is not robot:
+                arm_joints, _, _, carry = ru._spec_of(other)
+                ru.set_joint_positions(self._C, arm_joints, carry)
+
+    def get_joints(self, robots):
+        return [robot.spec.arm_joints for robot in robots]
+
+    def get_base_conf(self, robot):
+        return ru.Conf(robot, [], ())
+
+    def get_init_base_conf(self, robot):
+        return ru.Conf(robot, [], ())
+
+    def save_world(self):
+        return ru.save_world(self._C)
+
+    def restore_world(self, saved_world):
+        ru.restore_world(saved_world)
+
+    def _robot_zones(self):
+        """(robot index, that robot's private pick zone) for every robot -- the subclass hook
+        RoundTableRaiEnvironment overrides for N arms."""
+        return [(0, self.f_objs[0]), (1, self.f_objs[1])]
+
+    def _region_samples(self):
+        """(robot, block, region, action type) for every conflict-relevant action: each robot
+        transits from its own zone and transfers onto the shared drop_pad (f_objs[-1])."""
+        zones = self._robot_zones()
+        return [(self.robots[r], self.m_objs[r], zone, 'transit') for r, zone in zones] + \
+               [(self.robots[r], self.m_objs[r], self.f_objs[-1], 'transfer') for r, zone in zones]
+
+    def measure_region_offsets(self, duration=10.0):
+        """Motion-derived alpha_ik/beta_ik for this environment's two conflict-relevant action
+        types (robot0 transiting from zone_left, robot1 transiting from zone_right, both
+        transferring onto the shared drop_pad) -- see
+        mm_drrt/utils/rai_motion_planner_utils.py's sample_region_offsets() for how each one is
+        measured from a real IK/motion-planned trajectory. Collapses the two robots' per-region
+        samples into ONE (alpha, beta) pair per action type: the union (min entry, max exit)
+        across whatever measured successfully, so a region that WAS measured is never
+        under-protected by the collapse -- see mm_drrt/planner/pddl_domain.py's docstring for why
+        this is a domain-wide-constant approximation rather than the fully general per-(robot,
+        region) numeric-fluent mode, and compare_region_constraints_rai_env.py's docstring for why
+        even this collapsed form is used as an ASYMMETRIC reduction (only entry_offset for
+        transit, only exit_offset for transfer) rather than narrowing both sides of both action
+        types at once -- a Tamer search-scaling limit at this environment's size, not a domain
+        soundness issue.
+
+        Returns {'transit': (alpha, beta), 'transfer': (alpha, beta)} -- (0.0, duration) for
+        either action type if no valid grasp/IK/motion sample was found at all (conservative
+        fallback: an unmeasured action type looks like a full-duration mutex, never unprotected).
+
+        Each sample is wrapped in save_world()/restore_world() -- sample_region_offsets() moves
+        the object (placement sampling) and, for 'transit', attaches/detaches it to the gripper,
+        which is real state this method must not leak into the actual scene: this runs BEFORE
+        Tamer/PlanSkeleton, so any leftover pose or attachment would visibly corrupt the object's
+        position for the real plan that follows (confirmed -- without this wrapping, block0 ends
+        up floating at the gripper's approach pose instead of resting in its zone, causing visible
+        teleports/misalignment once the real pipeline runs). Matches the save_world()/
+        restore_world() pattern PlanSkeleton.initialize() and naive_duration_executor.py's
+        _refine_plan already use around their own trial sampling.
+        """
+        from mm_drrt.utils.rai_motion_planner_utils import sample_region_offsets
+
+        samples = {'transit': [], 'transfer': []}
+        for robot, m_obj, region, action_type in self._region_samples():
+            saved_world = self.save_world()
+            result = sample_region_offsets(robot, self._arm, self._grasp_type, m_obj, region,
+                                           action_type, duration, collision_objs=self.fixed_obstacles)
+            self.restore_world(saved_world)
+            if result is not None:
+                samples[action_type].append(result)
+
+        offsets = {}
+        for action_type in ('transit', 'transfer'):
+            measured = samples[action_type]
+            offsets[action_type] = (min(a for a, b in measured), max(b for a, b in measured)) \
+                if measured else (0.0, duration)
+        return offsets
+
+    def measure_region_timing(self, vel_scale=1.0, fallback_duration=10.0, samples_per_pair=3):
+        """C1 counterpart to measure_region_offsets(): the same four representative samples, but
+        TIMED under velocity-limited execution (mm_drrt/utils/motion_timing.py) instead of
+        index-fractions scaled to a declared duration -- so the durations themselves come from the
+        motion too.
+
+        Each (robot, region) pair is sampled samples_per_pair times and the SHORTEST valid sample is
+        kept: one sampled PRM path can be a large detour (observed: an 11.9s transit next to an
+        executed 2.2s one), and the collapse below takes the max across robots, so one outlier would
+        inflate the duration of every action of that type. Under-estimates are what the repair loop
+        (main_rai.py) widens from the executed path.
+
+        Returns {'transit': (alpha, beta, duration), 'transfer': (alpha, beta, duration)}, collapsed
+        across robots the same way (min entry, max exit, max duration). An action type with no
+        valid sample falls back to a full-duration mutex over fallback_duration."""
+        from mm_drrt.utils.rai_motion_planner_utils import sample_region_offsets
+        from mm_drrt.utils.motion_timing import velocity_limits
+
+        samples = {'transit': [], 'transfer': []}
+        for robot, m_obj, region, action_type in self._region_samples():
+            vlim = velocity_limits(ru._spec_of(robot)[0], vel_scale)
+            results = []
+            for _ in range(samples_per_pair):
+                saved_world = self.save_world()
+                result = sample_region_offsets(robot, self._arm, self._grasp_type, m_obj, region,
+                                               action_type, None, collision_objs=self.fixed_obstacles,
+                                               velocity_limits=vlim)
+                self.restore_world(saved_world)
+                if result is not None:
+                    results.append(result)
+            if results:
+                samples[action_type].append(min(results, key=lambda abd: abd[2]))
+
+        timing = {}
+        for action_type in ('transit', 'transfer'):
+            measured = samples[action_type]
+            timing[action_type] = (min(a for a, b, d in measured), max(b for a, b, d in measured),
+                                   max(d for a, b, d in measured)) \
+                if measured else (0.0, fallback_duration, fallback_duration)
+        return timing
+
+    def measure_executed_region_offsets(self, composite_path, duration=10.0):
+        """The EXECUTED-path counterpart to measure_region_offsets(): measures each robot's REAL,
+        dRRT*-refined trajectory -- not a representative pre-planning sample -- against the same
+        regions, in the same collapsed {'transit': (alpha, beta), 'transfer': (alpha, beta)}
+        shape, for direct comparison via mm_drrt/utils/temporal_repair.py's
+        repair_region_offsets().
+
+        Splitting one robot's full composite-path trajectory into its transit (pick) and transfer
+        (place) segments: concatenate node.sub_local_paths[r] across every node in composite_path
+        to get that robot's full joint-space path, find the grasp event (the first node where
+        node.attachments[r] becomes non-None -- per replay_composite_path's own docstring, that's
+        the LAST waypoint of that node's segment), then scan forward from there for the first
+        waypoint whose joint config exactly matches the robot's own carry_conf.
+        arm_retrieval_motion's goal is always carry_conf (mm_drrt/utils/rai_motion_planner_utils.py)
+        for BOTH transit's retrieval and transfer's approach start, so this lands on an EXACT
+        (confirmed via direct instrumentation: zero floating-point distance, not an approximate
+        threshold) boundary between "transit's retrieval has ended" and "transfer's approach is
+        about to begin" -- without needing to parse dRRT*'s own node.subprob_id bookkeeping at all.
+
+        A robot that never grasped anything in this composite_path (attachments[r] stays None
+        throughout), or where the carry_conf boundary is never found, is silently skipped for that
+        robot -- this is a best-effort real-path measurement, not a required one; the caller
+        should treat a missing action type here (None in the returned dict) as "nothing to repair
+        against this run," not an error.
+
+        Returns {'transit': (alpha, beta) or None, 'transfer': (alpha, beta) or None}.
+        """
+        from mm_drrt.utils.rai_motion_planner_utils import trajectory_region_fractions
+        from mm_drrt.utils.coordination_regions import region_volume_from_frame
+        import numpy as np
+
+        samples = {'transit': [], 'transfer': []}
+        for r, zone in self._robot_zones():
+            robot = self.robots[r]
+            arm_joints, gripper_frame, _, carry_conf = ru._spec_of(robot)
+            carry = np.asarray(carry_conf)
+
+            full_path, grasp_idx = [], None
+            for node in composite_path:
+                path_r = node.sub_local_paths[r] if node.sub_local_paths else []
+                full_path.extend(path_r)
+                if node.attachments and node.attachments[r] and grasp_idx is None:
+                    grasp_idx = len(full_path) - 1
+            if grasp_idx is None:
+                continue
+
+            split_idx = None
+            for i in range(grasp_idx, len(full_path)):
+                q = np.asarray(full_path[i][-len(arm_joints):])
+                if np.linalg.norm(q - carry) < 1e-6:
+                    split_idx = i
+                    break
+            if split_idx is None:
+                continue
+
+            transit_path = full_path[:split_idx + 1]
+            transfer_path = full_path[split_idx:]
+            transit_region = region_volume_from_frame(self._C, zone)
+            transfer_region = region_volume_from_frame(self._C, 'drop_pad')
+
+            transit_fracs = trajectory_region_fractions(robot, arm_joints, gripper_frame,
+                                                         transit_path, transit_region)
+            transfer_fracs = trajectory_region_fractions(robot, arm_joints, gripper_frame,
+                                                          transfer_path, transfer_region)
+            if transit_fracs is not None:
+                samples['transit'].append((transit_fracs[0] * duration, transit_fracs[1] * duration))
+            if transfer_fracs is not None:
+                samples['transfer'].append((transfer_fracs[0] * duration, transfer_fracs[1] * duration))
+
+        offsets = {}
+        for action_type in ('transit', 'transfer'):
+            measured = samples[action_type]
+            offsets[action_type] = (min(a for a, b in measured), max(b for a, b in measured)) \
+                if measured else None
+        return offsets
+
+    def _assign_target_obj_pose(self, actions, obj_orders, m_obj, action):
+        for a in actions:
+            if actions[a] == action:
+                for id in range(len(obj_orders)):
+                    if obj_orders[id] == a:
+                        if id == 0:
+                            self.m_objs_init_placements[m_obj].assign()
+                        else:
+                            actions[obj_orders[id - 1]].goal['place'].assign()
+
+    def create_plan_order_constraints(self):
+        # SAFE, manually-authored baseline. Each robot delivers its own block straight to the
+        # shared drop_pad -- no object links the two chains, so nothing here can be inferred
+        # automatically the way a same-object handoff constraint can (see the module docstring).
+        # {'pre': 'a1', 'post': 'a2'} is the constraint a human has to add by hand: robot1 may
+        # not even START moving toward drop_pad until robot0's transfer there has fully finished.
+        plan = {
+            'a0': ('transit',  self.robots[0], self.m_objs[0], None,           self.f_objs[0]),
+            'a1': ('transfer', self.robots[0], self.m_objs[0], self.f_objs[0], self.f_objs[2]),
+            'a2': ('transit',  self.robots[1], self.m_objs[1], None,           self.f_objs[1]),
+            'a3': ('transfer', self.robots[1], self.m_objs[1], self.f_objs[1], self.f_objs[2]),
+        }
+        action_orders = {self.robots[0]: ('a0', 'a1'),
+                         self.robots[1]: ('a2', 'a3')}
+        obj_orders = {self.m_objs[0]: ['a1'],
+                      self.m_objs[1]: ['a3']}
+        init_order_constraints = ({'pre': 'a1', 'post': 'a2'},)
+        return plan, action_orders, obj_orders, init_order_constraints
+
+    def create_pddl_problem(self):
+        """Stock mm_drrt_manipulation PDDL 2.1 problem -- no domain changes. Tamer can solve
+        this as-is; nothing in the domain prevents it from scheduling both transfers to
+        drop_pad concurrently, since obj-location/robot-can-reach say nothing about two
+        DIFFERENT objects sharing one fixed-obj at the same time (see module docstring)."""
+        objects = {
+            'robot':       [self.robots[0], self.robots[1]],
+            'movable-obj': [self.m_objs[0], self.m_objs[1]],
+            'fixed-obj':   [self.f_objs[0], self.f_objs[1], self.f_objs[2]],
+        }
+        init_state = [
+            ('robot-free',         self.robots[0]),
+            ('robot-free',         self.robots[1]),
+            ('robot-at-base',      self.robots[0]),
+            ('robot-at-base',      self.robots[1]),
+            ('obj-location',       self.m_objs[0], self.f_objs[0]),
+            ('obj-location',       self.m_objs[1], self.f_objs[1]),
+            ('obj-clear',          self.m_objs[0]),
+            ('obj-clear',          self.m_objs[1]),
+            ('surface-accessible', self.f_objs[0]),
+            ('surface-accessible', self.f_objs[1]),
+            ('surface-accessible', self.f_objs[2]),
+            ('robot-can-reach',    self.robots[0], self.f_objs[0]),
+            ('robot-can-reach',    self.robots[0], self.f_objs[2]),
+            ('robot-can-reach',    self.robots[1], self.f_objs[1]),
+            ('robot-can-reach',    self.robots[1], self.f_objs[2]),
+        ]
+        goal_state = [
+            ('obj-location', self.m_objs[0], self.f_objs[2]),
+            ('obj-location', self.m_objs[1], self.f_objs[2]),
+            ('robot-free',   self.robots[0]),
+            ('robot-free',   self.robots[1]),
+        ]
+        return objects, init_state, goal_state
+
+    def _create_problem(self):
+        self.custom_limits = {}
+
+        self._C.addFile(ry.raiPath(ru.TWO_ARM_SCENARIO))
+        ru.set_joint_positions(self._C, ru.LEFT_ARM.arm_joints, ru.LEFT_ARM.carry_conf)
+        ru.set_joint_positions(self._C, ru.RIGHT_ARM.arm_joints, ru.RIGHT_ARM.carry_conf)
+
+        self.fixed_obstacles = ['table']  # already defined (and contact-enabled) in pandasTable.g
+
+        f_objs = []
+        for key, x in ZONE_X.items():
+            name = f'zone_{key}'
+            self._C.addFrame(name).setPosition([x, SURFACE_Y, SURFACE_Z]).setShape(ry.ST.box, size=list(ZONE_SIZE)) \
+                .setColor([0.5, 0.5, 0.9]).setContact(0)
+            f_objs.append(name)
+        self._C.addFrame('drop_pad').setPosition([PAD_X, SURFACE_Y, SURFACE_Z]).setShape(ry.ST.box, size=list(PAD_SIZE)) \
+            .setColor([0.9, 0.7, 0.3]).setContact(0)
+        f_objs.append('drop_pad')
+
+        self.robots = {0: ru.RaiRobot(self._C, ru.LEFT_ARM), 1: ru.RaiRobot(self._C, ru.RIGHT_ARM)}
+        for robot in self.robots.values():
+            self.custom_limits[robot] = {}
+            self._grippers[robot] = get_gripper(robot)
+
+        box_z = SURFACE_Z + ZONE_SIZE[2] / 2.0 + BLOCK[2] / 2.0
+        block0_pos = (ZONE_X['left'], SURFACE_Y, box_z)
+        block0_name = create_box(self._C, 'block0', block0_pos, BLOCK, color=(1.0, 0.0, 0.0))
+        block1_pos = (ZONE_X['right'], SURFACE_Y, box_z)
+        block1_name = create_box(self._C, 'block1', block1_pos, BLOCK, color=(0.0, 0.0, 1.0))
+
+        self.m_objs = [block0_name, block1_name]
+        self.m_objs_init_placements = {
+            block0_name: ru.Pose(self._C, block0_name, (block0_pos, (1.0, 0.0, 0.0, 0.0)), 'zone_left'),
+            block1_name: ru.Pose(self._C, block1_name, (block1_pos, (1.0, 0.0, 0.0, 0.0)), 'zone_right'),
+        }
+        self.m_obj_in_f_obj = {'zone_left': {block0_name}, 'zone_right': {block1_name}}
+        self.f_objs = f_objs

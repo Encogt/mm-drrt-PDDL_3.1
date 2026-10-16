@@ -72,20 +72,26 @@ class DegreePRM(PRM):
                 # early termination of roadmap as soon as finding a path
                 if self(self.initial_conf, self.final_conf):
                     return new_vertices
-        # for v1 in new_vertices:
-        #     degree = 0
-        #     for _, v2 in sorted(filter(lambda pair: (pair[1] != v1) and (pair[0] <= self.connect_distance),
-        #                                map(lambda v: (self.distance_fn(v1.q, v.q), v), self.vertices.values())),
-        #                         key=operator.itemgetter(0)): # TODO - slow, use nearest neighbors
-        #         if self.target_degree <= degree:
-        #             break
-        #         if v2 not in v1.edges:
-        #             path = list(self.extend_fn(v1.q, v2.q))[:-1]
-        #             if not any(self.collision_fn(q) for q in default_selector(path)):
-        #                 self.connect(v1, v2, path)
-        #                 degree += 1
-        #         else:
-        #             degree += 1
+        else:
+            # No base/arm split to expand around (expand_dim == 0): e.g. a fixed-mount robot with
+            # no separate base and arm phases, where the "robot state" is the full sampled config.
+            for v1 in new_vertices:
+                degree = 0
+                for _, v2 in sorted(filter(lambda pair: (pair[1] != v1) and (pair[0] <= self.connect_distance),
+                                           map(lambda v: (self.distance_fn(v1.q, v.q), v), self.vertices.values())),
+                                    key=operator.itemgetter(0)): # TODO - slow, use nearest neighbors
+                    if self.target_degree <= degree:
+                        break
+                    if v2 not in v1.edges:
+                        path = list(self.extend_fn(v1.q, v2.q))[:-1]
+                        if not any(self.collision_fn(q) for q in default_selector(path)):
+                            self.connect(v1, v2, path)
+                            degree += 1
+                    else:
+                        degree += 1
+                # early termination of roadmap as soon as finding a path
+                if self(self.initial_conf, self.final_conf):
+                    return new_vertices
         return new_vertices
 
 
@@ -153,6 +159,7 @@ def prm(start, goal, sub_distance_fn, sub_sample_fn, sub_extend_fn, sub_collisio
         if use_debug:
             if expand_type == 'arm': error_type = 'base'
             elif expand_type == 'base': error_type = 'arm'
+            else: error_type = expand_type  # e.g. a fixed-arm robot has no separate base/arm split
             # raise SystemExit('ERROR: Number of samples is not enough to find a path in a roadmap. Increase the sample size. '
             #                  'Problem type: {}'.format(error_type))
             print('Number of samples is not enough to find a path in a roadmap. Increase the sample size. Problem type: {}'.format(error_type))

@@ -14,6 +14,39 @@ pip install -r requirements.txt
 python -m main
 ```
 
+The `robotic` package (imported as `ry`) ships a precompiled extension that requires a few system shared libraries. On Debian/Ubuntu, install them with:
+```
+sudo apt-get install -y liblapack3 libblas3 libglu1-mesa
+```
+
+### PDDL Planner (optional)
+
+To use `--use_pddl_planner`, two additional tools must be built from source.
+
+**1. Fast Downward**
+```
+git clone https://github.com/aibasel/downward.git ~/fast-downward
+cd ~/fast-downward
+python3 build.py
+```
+
+**2. universal-pddl-parser-multiagent** (serializes MA-PDDL to classical PDDL)
+```
+git clone --recursive https://github.com/aig-upf/universal-pddl-parser-multiagent.git ~/universal-pddl-parser-multiagent
+cd ~/universal-pddl-parser-multiagent/universal-pddl-parser
+scons
+cd ..
+scons examples/serialize_cn
+```
+
+If `scons` is not installed: `pip install scons`
+
+The code finds both tools automatically if they are at the default paths above. To use custom locations, set these environment variables:
+```
+export FAST_DOWNWARD_CMD=/path/to/fast-downward.py
+export UPDDL_SERIALIZER_CMD=/path/to/serialize.bin
+```
+
 ## Inputs and Parameters
 ### Inputs
 All the relevant files are included in the `/examples/envs/` folder. Find the `create_plan_order_constraints` function in the environment class, where inputs for a problem instance can be specified.

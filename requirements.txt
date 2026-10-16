@@ -1,7 +1,8 @@
 numpy
 pybullet
+robotic
 scipy
 matplotlib
 networkx
-unified-planning
-up-tamer
+unified_planning
+up_tamer

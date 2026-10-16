@@ -1,0 +1,954 @@
+"""RAI-flavored port of mm_drrt.utils.motion_planner_utils's orchestration layer (base_motion,
+arm_retrieval_motion, the IK/IR/grasp generators, sub_plan_joint_motion, get_inter_robots_collision_fn).
+
+Control flow mirrors the pybullet version function-for-function; only the leaf calls are swapped for
+mm_drrt.utils.rai_utils. The pure graph/dRRT* algorithm helpers (TreeNode, OptimalNode, roadmap
+bookkeeping, etc.) have no pybullet dependency at all and are reused directly from
+motion_planner_utils instead of being duplicated here.
+"""
+from itertools import islice
+import random
+import time
+
+import numpy as np
+
+from mm_drrt.utils import rai_utils as ru
+from mm_drrt.planner.prm import DegreePRM
+from mm_drrt.planner.prm import prm
+from mm_drrt.utils.motion_planner_utils import get_max_length_list
+from mm_drrt.utils.coordination_regions import region_volume_from_frame, point_in_region, \
+    DEFAULT_HEIGHT_MARGIN
+
+GRASP_LENGTH = 0.03
+APPROACH_DISTANCE = 0.1 + GRASP_LENGTH
+
+
+def _animate_to_pose(C, frame_name, target_pos, target_quat, pause_time, steps=8):
+    """Smoothly interpolates a frame's world pose from its current value to a target pose over
+    a few rendered frames, instead of an instantaneous position/orientation overwrite -- avoids
+    the visible 'snap'/teleport a single-frame correction produces, at either grasp or
+    placement."""
+    f = C.getFrame(frame_name)
+    start_pos = np.asarray(f.getPosition())
+    start_quat = np.asarray(f.getQuaternion())
+    target_pos = np.asarray(target_pos)
+    target_quat = np.asarray(target_quat)
+    for i in range(1, steps + 1):
+        t = i / steps
+        f.setPosition(start_pos + (target_pos - start_pos) * t)
+        q = start_quat + (target_quat - start_quat) * t
+        norm = np.linalg.norm(q)
+        f.setQuaternion(q / norm if norm > 1e-9 else target_quat)
+        C.view(False)
+        time.sleep(pause_time)
+
+
+def get_trivial_roadmap(conf, attachments=[]):
+    """A degenerate, no-op roadmap: start == goal == conf, nothing to actually plan. The
+    multi-robot dRRT* machinery (task_planner_utils.py's assign_order_constraints, subprob_id
+    indexing, etc.) hardcodes "3 roadmap segments per action" -- base motion, arm approach, arm
+    retrieval, matching the mobile-base scenario's compute_path -- so a fixed-arm env (no base
+    phase at all) must still contribute a 3rd placeholder roadmap per action rather than just 2,
+    or that indexing arithmetic silently misaligns between robots.
+
+    conf must be a real len(joints)-dimensional tuple, not (): get_substarts_subgoals() and
+    friends slice the flat per-robot conf history with a *fixed stride* of
+    dRRTStar.joint_dim = len(env.get_joints(robots)[0]) per subprob_id step -- a 0-length
+    placeholder would desync that indexing for every step after it. The robot's own carry_conf is
+    a natural choice (a real, definitely-safe conf); "base motion" is from carry to carry.
+
+    attachments must match whatever the robot is actually holding while idling through this
+    placeholder (e.g. [m_obj] for the gap between a transit that just grasped and the transfer
+    that carries it onward) -- NOT always empty. get_subattachments() (motion_planner_utils.py,
+    shared/unchanged) looks up "the segment just completed" as roadmaps[r][subprob_id[r] - 1]
+    whenever subprob_id[r] changed since the last tree node, assuming that always means a single
+    real step. _advance_past_trivial() (rai_drrt_star.py) can legitimately jump subprob_id by 2 in
+    one go to skip over a trivial segment, which makes that lookback land ON the trivial segment
+    instead of the real one before it -- so if this roadmap doesn't carry the correct holding
+    state itself, get_subattachments() under-reports it (attach happens late, visibly desynced
+    from the arm during replay) for that one transition.
+
+    Since start==goal, PRM.__call__ (external/pybullet_planning/motion/motion_planners/prm.py)
+    returns immediately without ever needing real sample/distance/extend/collision behavior --
+    these are unreachable no-ops."""
+    roadmap = DegreePRM(conf, conf, lambda: conf, lambda q1, q2: 0.0, lambda q1, q2: iter([conf]),
+                       lambda q, verbose=False: False, samples=[conf], target_degree=0,
+                       expand_type=None, expand_configs=(), attachments=attachments)
+    roadmap.final_conf = conf
+    heuristic_val = {roadmap.vertices[conf]: 0.0}
+    return roadmap, heuristic_val
+
+
+def _table_top(C):
+    """World Z of the highest table-like frame's top surface (see replay_composite_path), or None."""
+    table_tops = [f.getPosition()[2] + f.getSize()[2] / 2.0 for f in C.getFrames()
+                  if f.name.startswith('table') and len(f.getSize()) >= 3]
+    return max(table_tops) if table_tops else None
+
+
+def _clamp_held_above_table(C, obj_name, table_top):
+    """Floor clamp for a carried object -- see the table_top comment in replay_composite_path."""
+    obj_frame = C.getFrame(obj_name)
+    pos = obj_frame.getPosition()
+    # No safety margin beyond the natural resting height (table_top + half-extent,
+    # zero clearance) -- matching the exact formula the release branch below uses
+    # for "resting exactly on the surface" (rest_z). A held object naturally sits
+    # at this same zero-clearance height the instant it's grasped, before the arm
+    # has actually lifted it -- adding any positive margin here means that very
+    # first post-grasp waypoint always reads as "penetrating" and gets yanked up,
+    # which is exactly the spurious "block dips when grabbed" pop this was
+    # confirmed (via instrumentation: fired once, at exactly the margin's value, on
+    # every seed regardless of path) to cause. Still correctly catches genuine
+    # mid-carry penetration (pos[2] actually below this height), just no longer
+    # flags the normal, correct starting pose as one.
+    min_z = table_top + np.max(obj_frame.getSize()[:3]) / 2.0
+    if pos[2] < min_z:
+        obj_frame.setPosition([pos[0], pos[1], min_z])
+
+
+def _attach_held(C, gripper_frame, held, table_top, pause_time):
+    """Grasp `held` with gripper_frame during replay -- see replay_composite_path's attach branch."""
+    gripper = C.getFrame(gripper_frame)
+    grip_pos = np.asarray(gripper.getPosition())
+    C.attach(gripper_frame, held)
+    obj_frame = C.getFrame(held)
+    obj_size = np.asarray(obj_frame.getSize()[:3])
+    obj_quat = obj_frame.getQuaternion()
+    obj_pos = np.asarray(obj_frame.getPosition())
+    offset = obj_pos - grip_pos
+    dist = np.linalg.norm(offset)
+    direction = offset / dist if dist > 1e-6 else np.array([0.0, 0.0, -1.0])
+    target_dist = ru.box_support_distance(direction, obj_quat, obj_size)
+    attach_target = grip_pos + direction * target_dist
+    # node.attachments[r] is checked once per node, at its LAST waypoint (see the
+    # comment above this loop), so `held` can flip true before the gripper has
+    # actually finished descending to the true grasp_conf -- confirmed via
+    # instrumentation on a real 2-robot handoff run: at the exact waypoint this fired,
+    # grip_pos was still 4.3cm from the object while target_dist (the correct
+    # FINAL touching offset) was 7.5cm, so extrapolating grip_pos - direction *
+    # target_dist overshot straight through the object's already-correct resting pose
+    # and out the other side -- 3.2cm below the table's surface. _animate_to_pose then
+    # smoothly dragged the box down into the table over its interpolation, which is
+    # exactly the "block dips below the table, then pops back up" visible bug (the pop
+    # being the *next* node's own table_top floor clamp -- below, in the main
+    # per-waypoint loop -- finally catching the too-low box once the gripper's genuine
+    # upward motion carries it back past the resting height). That floor clamp doesn't
+    # cover this animation at all, so apply the same floor here.
+    if table_top is not None:
+        min_z = table_top + np.max(obj_size) / 2.0
+        attach_target[2] = max(attach_target[2], min_z)
+    _animate_to_pose(C, held, attach_target, obj_quat, pause_time)
+    # Finger opening width also uses box_support_distance, along the direction the
+    # fingers actually separate on (rai_utils.gripper_finger_axis) rather than the
+    # object's own local X/Y size -- a top grasp permits free rotation around the
+    # approach axis, so the box's footprint across the fingers' real closing
+    # direction varies with that rotation and isn't just its narrowest local
+    # dimension (confirmed: the previous min(obj_size[0], obj_size[1]) heuristic
+    # clipped whenever a solve landed on an orientation wider than that assumption).
+    finger_axis = ru.gripper_finger_axis(C, gripper_frame)
+    half_width = ru.box_support_distance(finger_axis, obj_quat, obj_size)
+    ru.set_gripper_fingers(C, gripper_frame, half_width + 0.003)
+
+
+def _release_to(C, gripper_frame, obj_name, dest_frame_name, pause_time):
+    """Release obj_name onto dest_frame_name during replay -- see replay_composite_path."""
+    C.attach(dest_frame_name, obj_name)
+    # C.attach() only reparents -- it preserves whatever world pose the object
+    # happened to have at this exact replay waypoint, which (same node-boundary
+    # granularity issue as above) can be short of where the plan actually intended it
+    # to land, leaving it floating above the surface instead of resting on it. Snap it
+    # down explicitly, using the same formula every placement was originally sampled
+    # with (sample_placement(), rai_utils.py): resting exactly on the destination
+    # surface, upright. Keeps the object's current X/Y (already close, since the arm's
+    # planned path targets the right horizontal position) and only corrects height +
+    # orientation, which is what "floating above the ground" actually is. Applied via
+    # a short smooth interpolation (_animate_to_pose) so the object visibly settles
+    # onto the surface instead of teleporting there.
+    dest = C.getFrame(dest_frame_name)
+    dest_pos = np.asarray(dest.getPosition())
+    dest_size = np.asarray(dest.getSize()[:3])
+    obj_frame = C.getFrame(obj_name)
+    obj_size = np.asarray(obj_frame.getSize()[:3])
+    cur_pos = np.asarray(obj_frame.getPosition())
+    rest_z = dest_pos[2] + dest_size[2] / 2.0 + obj_size[2] / 2.0
+    _animate_to_pose(C, obj_name, [cur_pos[0], cur_pos[1], rest_z], [1.0, 0.0, 0.0, 0.0], pause_time)
+    ru.set_gripper_fingers(C, gripper_frame)
+
+
+
+def replay_composite_path(C, composite_path, joints, release_targets, gripper_frames=None, pause_time=0.02,
+                          events=None):
+    """Step C through a solved composite_path (list of OptimalNode, from PlanSkeleton.plan_refinement)
+    in the live viewer. Neither this pipeline nor the pybullet original animates the plan on its own
+    -- the pybullet version needs a separate experiments/visualizer.py run against the pickled
+    output -- so this replays it directly in the same window used for planning.
+
+    Purely kinematic (C.setJointState() + C.attach()), matching the pattern the rai library's own
+    author uses for pick-and-place (rai-tutorials/demos/endless-box-pnp.py: play a motion, then
+    C.attach()) rather than driving a real physics engine. A real-physics version of this function
+    was tried and reverted: physx's own position controller has real tracking lag at any pace this
+    planner's waypoints imply, which reads as jank, and chasing that lag (larger tau, substepping,
+    proximity-gated retries) never converged to something both smooth and reliable -- confirmed
+    even the rai author's own physics-grasp demo (demos/botop-grasp.py) frames real-physics grasping
+    as a narrow, fragile test of PhysX's PD/friction response, not a general execution pattern, and
+    drives motion through BotOp's own spline-over-duration interface rather than a raw per-waypoint
+    position target as this function was doing.
+
+    joints: per-robot list of joint names (env.get_joints(robots)).
+    release_targets: dict mapping (robot index, movable-object frame name) to the frame it
+    should be reattached to once released (the composite_path only records which object is
+    currently grasped, not its destination -- the caller supplies the full mapping). Keyed by
+    (robot index, object), not just object: an object can go through more than one transfer
+    action over a plan (e.g. a relay handoff, one robot places it at a mid-point and a second
+    robot later places it at the final destination) -- a plain per-object mapping can only hold
+    one destination per object, so a later transfer for the same object would silently overwrite
+    an earlier robot's own destination.
+    gripper_frames: per-robot gripper frame name to attach a carried object to. Defaults to
+    ru.GRIPPER_FRAME for every robot (the single-mobile-robot scenario).
+    events: optional {robot index: {waypoint index in that robot's concatenated path: ('grasp' or
+    'release', object)}} (motion_timing.contact_events). For those robots, grasp/release happen at
+    exactly that waypoint instead of at the end of the node where node.attachments flips -- that
+    node can end before the arm reaches the place pose, and the arm then visibly descends to
+    "place" a block it already released.
+    """
+    num_robots = len(joints)
+    if gripper_frames is None:
+        gripper_frames = [ru.GRIPPER_FRAME] * num_robots
+    currently_attached = [None] * num_robots
+    for gf in gripper_frames:
+        ru.set_gripper_fingers(C, gf)
+    # Minimum safe world-Z for a CARRIED object, from whichever table-like frame(s) this scenario
+    # defines (name starting with 'table' -- the two-robot env's single 'table', or the
+    # single-robot env's 'table0'/'table1'; matched by prefix rather than one fixed name so this
+    # generalizes across both). The retrieval/approach-with-attachment motion is planned via
+    # joint-space PRM interpolation, which doesn't guarantee a sensible Cartesian trajectory for
+    # the (rigidly attached) held object between two validated joint-space waypoints. Confirmed
+    # via direct instrumentation on a real run: one of the planner's own validated waypoints had
+    # the carried box penetrating the table by ~2cm -- a real, detectable collision (confirmed
+    # with C.computeCollisions() on that exact replayed pose) that neither the default
+    # collision-checking resolution nor a 3x-finer one caught during planning. Rather than chase
+    # that gap through the shared PRM library, this clamps it defensively at replay time:
+    # whenever a carried object's world Z would put it below the highest table's top surface
+    # (plus its own half-extent, so its actual underside can't dip through), snap it back up,
+    # keeping X/Y untouched -- i.e. only correct the part that visibly reads as "sinking into the
+    # floor". Uses the single highest table top across every table-like frame rather than
+    # figuring out which table (if any) the object is currently over, since that's a simple,
+    # always-safe over-approximation for scenarios (both RAI envs, currently) where every table
+    # sits at the same height.
+    #
+    # Tried instead filtering/bridging the ARM's own waypoints so it would never reach an unsafe
+    # config in the first place (keeping the object rigidly attached throughout, no independent
+    # correction needed) -- reverted: that approach risked dropping or altering a node's true
+    # final waypoint (the exact grasp/place conf the composite-path tightening pass,
+    # rai_drrt_star.py, carefully aligned onto), which visibly broke grasp centering. This
+    # simpler correction only ever touches the object's own position, never the arm's path.
+    table_top = _table_top(C)
+    waypoint = [0] * num_robots
+    for node in composite_path:
+        n_j = get_max_length_list(node.sub_local_paths)
+        for j in range(n_j):
+            for r in range(num_robots):
+                path_r = node.sub_local_paths[r]
+                if not path_r:
+                    continue
+                q = path_r[-1] if len(path_r) <= j else path_r[j]
+                ru.set_joint_positions(C, joints[r], q)
+                if events and r in events and j < len(path_r):
+                    event = events[r].get(waypoint[r])
+                    waypoint[r] += 1
+                    if event and event[0] == 'grasp' and not currently_attached[r]:
+                        _attach_held(C, gripper_frames[r], event[1], table_top, pause_time)
+                        currently_attached[r] = event[1]
+                    elif event and event[0] == 'release' and currently_attached[r]:
+                        # The release waypoint is the arm's lowest one; clamp first, so the block
+                        # doesn't start its settle animation from inside the table.
+                        if table_top is not None:
+                            _clamp_held_above_table(C, currently_attached[r], table_top)
+                        _release_to(C, gripper_frames[r], currently_attached[r],
+                                    release_targets[(r, currently_attached[r])], pause_time)
+                        currently_attached[r] = None
+            if table_top is not None:
+                for r in range(num_robots):
+                    if not currently_attached[r]:
+                        continue
+                    _clamp_held_above_table(C, currently_attached[r], table_top)
+            C.view(False)
+            time.sleep(pause_time)
+        # Attach/detach checked once per node, at its LAST waypoint -- not at every waypoint
+        # starting from the first. A composite_path node is one dRRT* growth step, and its FIRST
+        # waypoint isn't guaranteed to sit exactly at the previous segment's boundary conf (that's
+        # only an invariant of the abstract subprob_id bookkeeping, not of where this particular
+        # node's interpolated path actually starts); node.attachments[r] describes the segment
+        # this node's growth step actually LANDS in, i.e. its last waypoint, not its first.
+        # Checking from j=0 can attach/release using whatever offset happens to exist mid-transit
+        # instead of the true grasp/placement pose -- confirmed via instrumentation on a
+        # physics-backed version of this function, where releasing at j=0 dropped an object ~0.4m
+        # short of its real placement target and the next robot's pickup, correctly planned
+        # against the (unreached) intended drop point, could never find it either.
+        for r in range(num_robots):
+            if events and r in events:
+                continue  # handled at the exact waypoint above
+            held = node.attachments[r] if node.attachments else None
+            if held and not currently_attached[r]:
+                # C.attach() only reparents -- it preserves whatever world pose the object
+                # happened to have at this exact replay waypoint (same node-boundary granularity
+                # issue as the release case below), which can leave the object floating short of
+                # the true grasp pose, or overlapping it, if that waypoint didn't land exactly on
+                # grasp_conf. A real touching grasp does NOT sit at zero offset from the gripper
+                # frame -- l_gripper is a small contact marker, not the object's center point --
+                # and the object's own orientation at the free rotation the grasp permits varies
+                # the touching offset's direction, so there's no single fixed target pose to snap
+                # to. Instead, keep the object's current (already roughly-converged) direction
+                # from the gripper, but recompute the *distance* along that direction so the
+                # object's surface exactly touches the gripper -- using the same box-support-
+                # distance formula verified against real KOMO negDistance=0 grasp solves
+                # (rai_utils.box_support_distance): this is always geometrically correct
+                # regardless of orientation, so it neither clips into the gripper nor floats.
+                # Applied via a short smooth interpolation (_animate_to_pose), not an instant
+                # position overwrite, since even a small single-frame jump reads as an
+                # unnatural "snap".
+                _attach_held(C, gripper_frames[r], held, table_top, pause_time)
+                currently_attached[r] = held
+            elif not held and currently_attached[r]:
+                _release_to(C, gripper_frames[r], currently_attached[r],
+                            release_targets[(r, currently_attached[r])], pause_time)
+                currently_attached[r] = None
+
+
+def replay_timed(C, execution, joints, release_targets, gripper_frames, dt=0.02, speed=1.0,
+                 clock_every=0.5, caption=None, on_tick=None):
+    """Plays an asynchronous execution (motion_timing.AsyncExecution) in the viewer against
+    wall-clock time: every robot follows its own timed trajectory, grasping/releasing at its own
+    event times -- unlike replay_composite_path, nobody waits at dRRT*'s composite nodes. Prints a
+    running clock with what each robot is doing. speed > 1 plays faster than real time.
+    caption: optional text shown in the viewer with the clock and each robot's current action.
+    on_tick(t): optional callback once per frame, after the scene is updated and before it is
+    drawn (e.g. to recolour a region or pause at a moment of interest)."""
+    num_robots = len(joints)
+    table_top = _table_top(C)
+    for gf in gripper_frames:
+        ru.set_gripper_fingers(C, gf)
+    attached = [None] * num_robots
+    pending = list(execution.events)
+    next_clock = 0.0
+    t = 0.0
+    while t <= execution.makespan + dt:
+        for r in range(num_robots):
+            q = execution.conf(r, t)
+            if q is not None:
+                ru.set_joint_positions(C, joints[r], list(q)[-len(joints[r]):])
+        while pending and pending[0].time <= t:
+            e = pending.pop(0)
+            if e.kind == 'grasp':
+                _attach_held(C, gripper_frames[e.robot_index], e.obj, table_top, 0.0)
+                attached[e.robot_index] = e.obj
+            else:
+                if table_top is not None:  # release happens at the lowest point: clamp first
+                    _clamp_held_above_table(C, e.obj, table_top)
+                _release_to(C, gripper_frames[e.robot_index], e.obj,
+                            release_targets[(e.robot_index, e.obj)], 0.0)
+                attached[e.robot_index] = None
+        if table_top is not None:
+            for r in range(num_robots):
+                if attached[r]:
+                    _clamp_held_above_table(C, attached[r], table_top)
+        doing = '  '.join(f"r{r}:{execution.active(r, t)[0] or '-'}" for r in range(num_robots))
+        if t >= next_clock:
+            print(f"  t={t:5.2f}s  {doing}")
+            next_clock += clock_every
+        if on_tick is not None:
+            on_tick(t)
+        if caption:
+            C.view(False, f"{caption}   t={t:5.2f}s   {doing}")
+        else:
+            C.view(False)
+        time.sleep(dt / speed)
+        t += dt
+
+
+def plan_joint_motion(robot, joints, end_conf, obstacles=[], attachments=[],
+                      self_collisions=True, disabled_collisions=set(),
+                      weights=None, resolutions=None, max_distance=None,
+                      use_aabb=False, cache=True, custom_limits={}, use_drrt_star=False,
+                      use_debug_plot=False, **kwargs):
+    assert len(joints) == len(end_conf)
+    if (weights is None) and (resolutions is not None):
+        weights = np.reciprocal(resolutions)
+    sample_fn = ru.get_sample_fn(robot, joints, custom_limits=custom_limits)
+    distance_fn = ru.get_distance_fn(robot, joints, weights=weights)
+    extend_fn = ru.get_extend_fn(robot, joints, resolutions=resolutions)
+    collision_fn = ru.get_collision_fn(robot, joints, obstacles, attachments, self_collisions,
+                                       disabled_collisions, custom_limits=custom_limits)
+
+    start_conf = ru.get_joint_positions(robot, joints)
+    if not ru.check_initial_end(start_conf, end_conf, collision_fn):
+        return None
+    return prm(start_conf, end_conf, distance_fn, sample_fn, extend_fn, collision_fn,
+              use_drrt_star=use_drrt_star, use_debug_plot=use_debug_plot, **kwargs)
+
+
+def base_motion(robot, base_start, base_goal, teleport=False, obstacles=[], attachments=[], custom_limits={},
+                num_samples=100, expand_type=None, expand_configs=None, use_debug=False):
+    base_joints = ru.BASE_JOINTS
+    ru.set_joint_positions(robot, base_joints, base_start)
+    base_goal = base_goal[:len(base_joints)]
+
+    if teleport:
+        ru.set_joint_positions(robot, base_joints, base_start)
+        if any(ru.robot_obstacle_collision(robot, [b]) for b in obstacles):
+            return None
+        ru.set_joint_positions(robot, base_joints, base_goal)
+        if any(ru.robot_obstacle_collision(robot, [b]) for b in obstacles):
+            return None
+        return [base_start, base_goal]
+
+    resolutions = np.array([2 * ru.DEFAULT_BASE_RESOLUTION, 2 * ru.DEFAULT_BASE_RESOLUTION,
+                            ru.DEFAULT_BASE_RESOLUTION])
+    for _ in range(5):
+        roadmap, heuristic_val = sub_plan_joint_motion(robot, base_joints, base_goal, obstacles=obstacles,
+                                                       attachments=attachments, resolutions=resolutions,
+                                                       custom_limits=custom_limits, use_drrt_star=True,
+                                                       num_samples=num_samples, expand_type=expand_type,
+                                                       expand_configs=expand_configs, use_debug=use_debug)
+        if roadmap is None:
+            num_samples += 20
+            ru.set_joint_positions(robot, base_joints, base_start)
+        else:
+            break
+    if not roadmap:
+        ru.set_joint_positions(robot, base_joints, base_start)
+    ru.set_joint_positions(robot, base_joints, base_goal)
+    return roadmap, heuristic_val
+
+
+def arm_retrieval_motion(robot, arm, type, grasp, start, goal, obstacles=[], attachments=[], custom_limits={},
+                         num_samples=100, expand_type=None, expand_configs=None, use_debug=False,
+                         arm_joints=None):
+    arm_joints, _, _, _ = ru._spec_of(robot, arm_joints)
+    ru.set_joint_positions(robot, arm_joints, start)
+    resolutions = 0.05 ** np.ones(len(arm_joints))
+    for _ in range(5):
+        roadmap, heuristic_val = sub_plan_joint_motion(robot, arm_joints, goal, obstacles=obstacles,
+                                                       attachments=attachments, self_collisions=False,
+                                                       resolutions=resolutions, custom_limits=custom_limits,
+                                                       use_drrt_star=True, num_samples=num_samples,
+                                                       expand_type=expand_type, expand_configs=expand_configs,
+                                                       use_debug=use_debug)
+        if roadmap is None:
+            num_samples += 20
+            ru.set_joint_positions(robot, arm_joints, start)
+        else:
+            break
+    if not roadmap:
+        ru.set_joint_positions(robot, arm_joints, start)
+        return None, None
+    ru.set_joint_positions(robot, arm_joints, goal)
+    return roadmap, heuristic_val
+
+
+def get_ir_sampler(robot, gripper, custom_limits={}, max_attempts=25, collisions=True, collision_objs=[],
+                   num_samples=100, learned=True, use_debug=False):
+    # Note: 'learned' (PR2 IK-reachability model) has no RAI equivalent; always uniform-sample the
+    # base pose near the target, as documented in the plan.
+    obstacles = collision_objs if collisions else []
+
+    def gen_fn(arm, obj, pose, grasp):
+        pose.assign()
+        target_xy = ru.get_frame_position(robot, obj)[:2]
+        base_joints = ru.BASE_JOINTS
+        lower_limits, upper_limits = ru.get_custom_limits(robot, base_joints, custom_limits)
+        base_generator = ru.uniform_pose_generator(robot, target_xy)
+        while True:
+            for base_conf in islice(base_generator, max_attempts):
+                if not ru.all_between(lower_limits, base_conf, upper_limits):
+                    continue
+                bq = ru.Conf(robot, base_joints, base_conf)
+                pose.assign()
+                bq.assign()
+                ru.set_joint_positions(robot, ru.ARM_JOINTS, grasp.carry)
+                if any(ru.robot_obstacle_collision(robot, [b]) for b in obstacles + [obj]):
+                    continue
+                yield (bq,)
+                break
+            else:
+                yield None
+
+    return gen_fn
+
+
+def get_grasp_gen(grasp_type, collisions=False, randomize=True):
+    def fn(robot, body):
+        # The grasp's carry pose is where every approach starts and every retrieval ends, so it has
+        # to be THIS robot's own carry_conf (RoundTableRaiEnvironment turns its arms' carry aside).
+        carry = ru._spec_of(robot)[3]
+        if grasp_type == 'top':
+            grasps = ru.get_top_grasps(body, carry=carry)
+        elif grasp_type == 'side':
+            grasps = ru.get_side_grasps(body, carry=carry)
+        else:
+            raise ValueError('Unexpected grasp type:', grasp_type)
+        if randomize:
+            random.shuffle(grasps)
+        return [(g,) for g in grasps]
+
+    return fn
+
+
+def get_placement_gen(robot, **kwargs):
+    def gen(body, surface):
+        while True:
+            body_pose = ru.sample_placement(robot, body, surface, **kwargs)
+            if body_pose is None:
+                break
+            p = ru.Pose(robot, body, body_pose, surface)
+            yield (p,)
+    return gen
+
+
+def get_stable_gen(robot, collisions=True, **kwargs):
+    def gen(body, surface, obstacles):
+        while True:
+            body_pose = ru.sample_placement(robot, body, surface, **kwargs)
+            if body_pose is None:
+                break
+            p = ru.Pose(robot, body, body_pose, surface)
+            p.assign()
+            if not any(ru.pairwise_collision(robot, body, obst) for obst in obstacles if obst not in {body, surface}):
+                yield (p,)
+    return gen
+
+
+def get_ik_fn(robot, custom_limits={}, collisions=True, collision_objs=[], use_debug=False, arm_joints=None):
+    obstacles = collision_objs if collisions else []
+    arm_joints, _, _, _ = ru._spec_of(robot, arm_joints)
+
+    def fn(arm, obj, pose, grasp, base_conf):
+        pose.assign()
+        if base_conf is not None:
+            base_conf.assign()
+        ru.set_joint_positions(robot, arm_joints, grasp.carry)
+        base_values = base_conf.values if base_conf is not None else None
+        grasp_conf = ru.rai_ik(robot, base_values, grasp, custom_limits=custom_limits, arm_joints=arm_joints)
+        if grasp_conf is None:
+            if use_debug:
+                print('Grasp IK failure: no IK solution')
+            return (None, None)
+        ru.set_joint_positions(robot, arm_joints, grasp_conf)
+        # Validate both self-collision (rai_ik solves with enableCollisions=False, so a solution can
+        # be self-colliding, e.g. wrist twisted into the forearm) and collision against obstacles.
+        # obj itself is excluded: at the grasp conf the gripper is expected to touch/enclose it.
+        if ru.check_collisions(robot, obstacles, self_collisions=True, verbose=use_debug):
+            if use_debug:
+                print('Grasp IK failure: colliding solution', grasp_conf)
+            return (None, None)
+        # Approach conf: unlike pybullet-planning's separate sub_inverse_kinematics call to an offset
+        # approach pose, we reuse the grasp IK result as the approach target too (retrieval motion
+        # supplies the actual collision-checked path between them) -- sufficient to prove the
+        # pipeline end-to-end.
+        approach_conf = grasp_conf
+        return (approach_conf, grasp_conf)
+
+    return fn
+
+
+def _path_clips_object(robot, arm_joints, path, obj):
+    """True if some config along path has a robot frame penetrating obj. obj is deliberately left
+    out of the `obstacles` list get_arm_motion_fn's roadmap is built against -- otherwise the final
+    grasp_conf, which is supposed to touch obj, would always register as a collision and get
+    rejected -- but that exclusion applies to every waypoint, not just the last one, so nothing
+    stops the PRM from routing straight through obj's volume on the way there. Called on
+    path[:-1] (the last waypoint, the grasp itself, is expected to touch obj)."""
+    for q in path:
+        ru.set_joint_positions(robot, arm_joints, q[-len(arm_joints):])
+        if ru.robot_obstacle_collision(robot, [obj]):
+            return True
+    return False
+
+
+def get_arm_motion_fn(robot, custom_limits={}, collisions=True, collision_objs=[], num_samples=100,
+                      expand_type=None, expand_configs=None, use_debug=False, arm_joints=None):
+    obstacles = collision_objs if collisions else []
+    arm_joints, _, _, _ = ru._spec_of(robot, arm_joints)
+
+    def fn(arm, obj, grasp, approach_conf, grasp_conf, attachments=[]):
+        roadmap, heuristic_val = None, None
+        resolutions = 0.05 ** np.ones(len(arm_joints))
+        ru.set_joint_positions(robot, arm_joints, grasp.carry)
+        _num_samples = num_samples
+        for _ in range(5):
+            roadmap, heuristic_val = sub_plan_joint_motion(robot, arm_joints, approach_conf, attachments=attachments,
+                                                           obstacles=obstacles, self_collisions=True,
+                                                           custom_limits=custom_limits, resolutions=resolutions,
+                                                           use_drrt_star=True, num_samples=_num_samples,
+                                                           expand_type=expand_type, expand_configs=expand_configs,
+                                                           use_debug=use_debug)
+            if roadmap is None:
+                _num_samples += 20
+                ru.set_joint_positions(robot, arm_joints, grasp.carry)
+            else:
+                break
+        if roadmap is None:
+            if use_debug:
+                print('Roadmap is not found')
+            ru.set_joint_positions(robot, arm_joints, grasp.carry)
+            return (None, None)
+        approach_path = roadmap(expand_configs + tuple(grasp.carry), expand_configs + tuple(approach_conf))
+        if approach_path is None:
+            if use_debug:
+                print('Approach path failure')
+            return (None, None)
+        if not attachments and _path_clips_object(robot, arm_joints, approach_path[:-1], obj):
+            if use_debug:
+                print('Approach path clips the target object before reaching the grasp pose')
+            ru.set_joint_positions(robot, arm_joints, grasp.carry)
+            return (None, None)
+        ru.set_joint_positions(robot, arm_joints, approach_conf)
+        grasp_path = ru.plan_direct_joint_motion(robot, arm_joints, grasp_conf, attachments=attachments,
+                                                 obstacles=obstacles, self_collisions=True,
+                                                 custom_limits=custom_limits, resolutions=resolutions / 2.)
+        if grasp_path is None:
+            if use_debug:
+                print('Grasp path failure')
+            return (None, None)
+        ru.set_joint_positions(robot, arm_joints, grasp_conf)
+
+        grasp_conf = expand_configs + tuple(grasp_conf)
+        grasp_path = [expand_configs + tuple(g) for g in grasp_path]
+        roadmap.add([grasp_conf])
+        roadmap.connect(roadmap.vertices[roadmap.final_conf], roadmap.vertices[grasp_conf], grasp_path)
+        roadmap.final_conf = grasp_conf
+        for v in heuristic_val.keys():
+            heuristic_val[v] += 1.0
+        heuristic_val[roadmap.vertices[grasp_conf]] = 0.0
+        return (roadmap, heuristic_val)
+
+    return fn
+
+
+def get_ik_ir_gen(robot, gripper, max_attempts=25, learned=True, use_debug=False, **kwargs):
+    ir_sampler = get_ir_sampler(robot, gripper, learned=learned, max_attempts=max_attempts, **kwargs)
+    ik_fn = get_ik_fn(robot, **kwargs)
+
+    def gen(*inputs):
+        b, a, p, g = inputs
+        ir_generator = ir_sampler(*inputs)
+        attempts = 0
+        while True:
+            if use_debug:
+                print('attempts', attempts)
+            if max_attempts <= attempts:
+                if not p.init:
+                    return
+                attempts = 0
+                yield None
+            attempts += 1
+            try:
+                ir_outputs = next(ir_generator)
+            except StopIteration:
+                return
+            if ir_outputs is None:
+                continue
+            ik_outputs = ik_fn(*(inputs + ir_outputs))
+            if ik_outputs is None or ik_outputs[0] is None:
+                continue
+            if use_debug:
+                print('IK attempts:', attempts)
+            yield ir_outputs + ik_outputs
+            return
+
+    return gen
+
+
+def get_fixed_arm_ik_ir_gen(robot, max_attempts=25, use_debug=False, **kwargs):
+    """Fixed-arm analogue of get_ik_ir_gen, for a robot with no base joints (the arm is bolted
+    down, so there's nothing to search over the way get_ir_sampler searches candidate base poses
+    -- the only real search is the grasp IK itself, which rai_ik already random-restarts
+    internally). Still yields the same (bq, approach_conf, grasp_conf) 3-tuple shape get_ik_ir_gen
+    does -- bq is a trivial Conf over zero joints -- so callers (subgoal_sampling, compute_path)
+    don't need a different code path for the fixed-arm vs mobile-base scenario."""
+    ik_fn = get_ik_fn(robot, use_debug=use_debug, **kwargs)
+
+    def gen(arm, obj, pose, grasp):
+        bq = ru.Conf(robot, [], ())
+        for attempts in range(max_attempts):
+            if use_debug:
+                print('attempts', attempts)
+            ik_outputs = ik_fn(arm, obj, pose, grasp, None)
+            if ik_outputs is None or ik_outputs[0] is None:
+                continue
+            if use_debug:
+                print('IK attempts:', attempts)
+            yield (bq,) + ik_outputs
+            return
+        yield None
+
+    return gen
+
+
+def get_fixed_arm_pick_place_ik_gen(robot, max_attempts=25, use_debug=False, custom_limits={},
+                                    start_collision_objs=[], goal_collision_objs=[], arm_joints=None):
+    """Fixed-arm pick+place analogue of get_fixed_arm_ik_ir_gen, but solves grasp_conf and
+    place_conf TOGETHER via ru.rai_pick_place_ik() (one 2-phase KOMO problem with an explicit
+    ry.SY.stable mode switch) instead of as two independent single-keyframe rai_ik() calls -- see
+    rai_pick_place_ik()'s docstring for why that matters: two independent solves can each land on
+    a different valid touching geometry for a top/side grasp's free rotation about the approach
+    axis, so an arm that reaches both confs exactly can still leave the carried object several cm
+    off its intended placement pose. A single joint solve can't be handed two different obstacle
+    sets directly (it only sees one C snapshot for its own soft collision term), so the two
+    confs are collision-checked separately afterward, each against its own obstacle list and with
+    that phase's own obstacle poses (re-)assigned first -- matching what the two independent
+    rai_ik() calls already did.
+
+    Yields (start_output, goal_output), each a (bq, approach_conf, conf) 3-tuple -- the same
+    shape get_fixed_arm_ik_ir_gen yields for a single call -- so subgoal_sampling can swap in
+    this function without changing how it unpacks the results."""
+    arm_joints, _, _, _ = ru._spec_of(robot, arm_joints)
+
+    def gen(arm, obj, start_pose, grasp, place_pose, start_obst_poses=(), goal_obst_poses=()):
+        bq = ru.Conf(robot, [], ())
+        for attempts in range(max_attempts):
+            if use_debug:
+                print('pick-place attempts', attempts)
+            for obst_pose in start_obst_poses:
+                obst_pose.assign()
+            start_pose.assign()
+            grasp_conf, place_conf = ru.rai_pick_place_ik(robot, grasp, place_pose.value,
+                                                           custom_limits=custom_limits, arm_joints=arm_joints)
+            if grasp_conf is None:
+                continue
+            ru.set_joint_positions(robot, arm_joints, grasp_conf)
+            if ru.check_collisions(robot, start_collision_objs, self_collisions=True, verbose=use_debug):
+                continue
+            for obst_pose in goal_obst_poses:
+                obst_pose.assign()
+            ru.set_joint_positions(robot, arm_joints, place_conf)
+            if ru.check_collisions(robot, goal_collision_objs, self_collisions=True, verbose=use_debug):
+                continue
+            if use_debug:
+                print('pick-place IK attempts:', attempts)
+            yield ((bq, grasp_conf, grasp_conf), (bq, place_conf, place_conf))
+            return
+        yield None
+
+    return gen
+
+
+def get_gripper(robot_id, arm='left', visual=True):
+    _, gripper_frame, _, _ = ru._spec_of(robot_id)
+    return gripper_frame
+
+
+def get_configuration(robot, name):
+    arm_joints, _, base_joints, _ = ru._spec_of(robot)
+    if name == 'base':
+        return ru.get_joint_positions(robot, base_joints)
+    return ru.get_joint_positions(robot, arm_joints)
+
+
+def get_arm_positions(robot, arm):
+    arm_joints, _, _, _ = ru._spec_of(robot)
+    return ru.get_joint_positions(robot, arm_joints)
+
+
+def sub_plan_joint_motion(robot, joints, end_conf, obstacles=[], attachments=[],
+                          self_collisions=True, disabled_collisions=set(),
+                          weights=None, resolutions=None, max_distance=None,
+                          use_aabb=False, cache=True, custom_limits={}, use_drrt_star=False,
+                          use_debug_plot=False, **kwargs):
+    assert len(joints) == len(end_conf)
+    if (weights is None) and (resolutions is not None):
+        weights = np.reciprocal(resolutions)
+    sub_sample_fn = ru.get_sample_fn(robot, joints, custom_limits=custom_limits)
+    sub_distance_fn = ru.get_distance_fn(robot, joints, weights=weights)
+    sub_extend_fn = ru.get_extend_fn(robot, joints, resolutions=resolutions)
+    sub_collision_fn = ru.get_collision_fn(robot, joints, obstacles, attachments, self_collisions,
+                                           disabled_collisions, custom_limits=custom_limits)
+
+    start_conf = ru.get_joint_positions(robot, joints)
+    if not ru.check_initial_end(start_conf, end_conf, sub_collision_fn):
+        return None, None
+    from mm_drrt.utils.motion_planner_utils import debug_2d_sub_roadmap
+    return prm(start_conf, end_conf, sub_distance_fn, sub_sample_fn, sub_extend_fn, sub_collision_fn,
+              attachments=attachments, use_drrt_star=use_drrt_star, use_debug_plot=use_debug_plot,
+              debug_roadmap_fn=debug_2d_sub_roadmap, **kwargs)
+
+
+def get_inter_robots_collision_fn(robots, joints, num_robots=1, tolerance=None, **kwargs):
+    """dRRT*'s composite-state collision check between distinct robots. Multiple robots can share
+    one ry.Config (the fixed dual-arm scenario) or each have their own; either way, every robot
+    that's a RaiRobot carries its own spec.frame_prefix, which is how a colliding frame pair gets
+    attributed to two DIFFERENT robots (a pair sharing one robot's prefix is that robot's own
+    self-collision, already checked elsewhere -- not this function's job)."""
+    if tolerance is None:
+        tolerance = ru.COLLISION_TOLERANCE
+    prefixes = [(r.spec.frame_prefix if isinstance(r, ru.RaiRobot) else None) for r in robots]
+
+    def _cross_robot_pair(a, b):
+        for i in range(num_robots):
+            for j in range(num_robots):
+                if i == j or not prefixes[i] or not prefixes[j]:
+                    continue
+                if a.startswith(prefixes[i]) and b.startswith(prefixes[j]):
+                    return i, j
+        return None
+
+    def drrt_collision_fn(q, mode='boolean', skip_index=[]):
+        for r in range(num_robots):
+            ru.set_joint_positions(robots[r], joints[r], q[r])
+
+        seen, collisions = set(), []
+        for r in range(num_robots):
+            C = ru._config_of(robots[r])
+            if id(C) in seen:
+                continue
+            seen.add(id(C))
+            C.computeCollisions()
+            collisions.extend(C.getCollisions())
+
+        if mode == 'boolean':
+            for a, b, pen in collisions:
+                if pen >= -tolerance:
+                    continue
+                if _cross_robot_pair(a, b):
+                    return True
+            return False
+        elif mode == 'index':
+            collision_robot_index = []
+            for a, b, pen in collisions:
+                if pen >= -tolerance:
+                    continue
+                pair = _cross_robot_pair(a, b)
+                if pair and pair[0] not in skip_index and pair[1] not in skip_index:
+                    collision_robot_index.extend(pair)
+            return list(np.unique(collision_robot_index))
+    return drrt_collision_fn
+
+
+##### Motion-derived region entry/exit offsets #####
+# What computes alpha_ik/beta_ik ("Oi = {(Rk, [alpha_ik, beta_ik])}") from a REAL, IK/motion-
+# planned trajectory instead of a hand-picked CLI constant -- see
+# mm_drrt/planner/pddl_domain.py's docstring for how these offsets are used once derived, and its
+# module-level note on why they're a representative sample, not a live per-plan value.
+
+def _extract_roadmap_path(roadmap):
+    """A roadmap (DegreePRM, mm_drrt/planner/prm.py) records the (start, goal) it was solved for
+    as .initial_conf/.final_conf -- calling it again with those retraces the concrete waypoint
+    path, same as naive_duration_executor.py's _extract_path and get_arm_motion_fn's own internal
+    use of the mechanism."""
+    path = roadmap(roadmap.initial_conf, roadmap.final_conf)
+    return path if path else [roadmap.final_conf]
+
+
+def gripper_positions_along_path(robot, arm_joints, gripper_frame, path):
+    """FK: the gripper frame's world position at each waypoint of an arm-joint-space path. path
+    entries may carry extra leading values (get_arm_motion_fn's expand_configs prefix) -- only the
+    last len(arm_joints) values are ever the arm's own joint state, matching how
+    _path_clips_object already slices waypoints elsewhere in this file."""
+    C = ru._config_of(robot)
+    positions = []
+    for q in path:
+        ru.set_joint_positions(robot, arm_joints, q[-len(arm_joints):])
+        positions.append(tuple(C.getFrame(gripper_frame).getPosition()))
+    return positions
+
+
+def trajectory_region_fractions(robot, arm_joints, gripper_frame, path, region):
+    """(entry_fraction, exit_fraction) in [0, 1] of `path`'s length during which the gripper is
+    inside `region` (a coordination_regions.RegionVolume), or None if it never is. Fractions, not
+    raw indices/times, since the caller scales them against the action's own declared duration."""
+    positions = gripper_positions_along_path(robot, arm_joints, gripper_frame, path)
+    inside = [i for i, p in enumerate(positions) if point_in_region(p, region)]
+    if not inside:
+        return None
+    n = len(positions) - 1 if len(positions) > 1 else 1
+    return inside[0] / n, inside[-1] / n
+
+
+def sample_region_offsets(robot, arm, grasp_type, m_obj, region_frame, action_type, duration,
+                          height_margin=DEFAULT_HEIGHT_MARGIN, num_arm_samples=100,
+                          collision_objs=(), max_grasp_attempts=5, arm_joints=None,
+                          gripper_frame=None, use_debug=False, velocity_limits=None, return_path=False):
+    """Samples ONE representative arm trajectory into/out of region_frame -- 'transit' picks m_obj
+    up FROM a pose sampled in region_frame, 'transfer' places it ONTO one -- and measures, via
+    trajectory_region_fractions, the fraction of that trajectory during which the gripper is
+    actually inside the region's coordination_regions.region_volume_from_frame(). Returns
+    (alpha, beta) scaled to `duration` (the action's declared nominal duration), or None if no
+    valid grasp/IK/motion sample was found (the caller should then fall back to treating the whole
+    action as conflicting with the region, i.e. alpha=0, beta=duration).
+
+    Reuses the SAME low-level IK/motion primitives (get_grasp_gen, get_placement_gen,
+    get_fixed_arm_pick_place_ik_gen, get_arm_motion_fn, arm_retrieval_motion) the real per-plan
+    path computation (mm_drrt/utils/rai_task_planner_utils.py's individual_path_computation, via
+    env.compute_path) drives -- just without that machinery's plan-specific Action/subgoal
+    bookkeeping, since this has to run BEFORE Tamer has produced a plan to refine. It therefore
+    measures a representative sample (any valid grasp/placement for m_obj at region_frame), not
+    the specific trajectory the eventual plan will execute.
+
+    With velocity_limits (per-arm-joint rad/s, see mm_drrt/utils/motion_timing.py) the sample is
+    timed instead of index-scaled: returns (t_entry, t_exit, total_time) in seconds of
+    velocity-limited motion, and `duration` is unused.
+
+    With return_path, returns (that result, the sampled joint-space path) instead -- for animating
+    the representative trajectory (demos/demo2_motion_intervals.py).
+    """
+    C = ru._config_of(robot)
+    arm_joints, gripper_frame, _, carry_conf = ru._spec_of(robot, arm_joints, gripper_frame)
+    region = region_volume_from_frame(C, region_frame, height_margin=height_margin)
+    collision_objs = list(collision_objs)
+
+    place_gen = get_placement_gen(robot)(m_obj, region_frame)
+    pose = next(place_gen, None)
+    if pose is None:
+        return None
+    (pose,) = pose
+
+    grasps = get_grasp_gen(grasp_type)(robot, m_obj)
+    pick_place_fn = get_fixed_arm_pick_place_ik_gen(
+        robot, max_attempts=1, use_debug=use_debug, arm_joints=arm_joints,
+        start_collision_objs=collision_objs, goal_collision_objs=collision_objs)
+    arm_motion_fn = get_arm_motion_fn(robot, collision_objs=collision_objs,
+                                      num_samples=num_arm_samples, arm_joints=arm_joints,
+                                      expand_type=None, expand_configs=(), use_debug=use_debug)
+
+    for (grasp,) in grasps[:max_grasp_attempts]:
+        ik_result = next(pick_place_fn(arm, m_obj, pose, grasp, pose), None)
+        if ik_result is None:
+            continue
+        (_, approach_conf, grasp_conf), _ = ik_result
+
+        pose.assign()
+        attachments = [m_obj] if action_type == 'transfer' else []
+        approach_roadmap, _ = arm_motion_fn(arm, m_obj, grasp, approach_conf, grasp_conf,
+                                            attachments=attachments)
+        if approach_roadmap is None:
+            continue
+
+        if action_type == 'transit':
+            grasp.attach(C, gripper_frame=gripper_frame)
+        retrieval_attachments = [m_obj] if action_type == 'transit' else []
+        retrieval_roadmap, _ = arm_retrieval_motion(
+            robot, arm, action_type, grasp=grasp, start=approach_roadmap.final_conf,
+            goal=carry_conf, obstacles=collision_objs, attachments=retrieval_attachments,
+            num_samples=num_arm_samples, expand_type=None, expand_configs=(),
+            arm_joints=arm_joints, use_debug=use_debug)
+        if action_type == 'transit':
+            grasp.detach(C, region_frame)
+        if retrieval_roadmap is None:
+            continue
+
+        full_path = _extract_roadmap_path(approach_roadmap) + _extract_roadmap_path(retrieval_roadmap)
+        if velocity_limits is not None:
+            from mm_drrt.utils.motion_timing import trajectory_region_times
+            t_entry, t_exit, total = trajectory_region_times(robot, arm_joints, gripper_frame,
+                                                             full_path, region, velocity_limits)
+            if t_entry is None:
+                continue
+            return ((t_entry, t_exit, total), full_path) if return_path else (t_entry, t_exit, total)
+        fractions = trajectory_region_fractions(robot, arm_joints, gripper_frame, full_path, region)
+        if fractions is None:
+            continue
+        alpha_frac, beta_frac = fractions
+        result = (alpha_frac * duration, beta_frac * duration)
+        return (result, full_path) if return_path else result
+
+    return None

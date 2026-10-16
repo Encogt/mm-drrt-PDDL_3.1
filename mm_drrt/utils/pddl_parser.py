@@ -1,14 +1,91 @@
 """
 PDDL Plan Parser for MM-dRRT
 
-This module converts PDDL plans (from UPF or other planners) into MM-dRRT's
-expected format: (plan, action_orders, obj_orders, init_order_constraints).
+This module converts PDDL plans from UPF-style planners or Fast Downward into
+MM-dRRT's expected format: (plan, action_orders, obj_orders,
+init_order_constraints).
 """
 
 from collections import defaultdict
 
+# transit/transfer get split into up to 3 chained sub-actions (approach/occupy/depart) when
+# mm_drrt/planner/pddl_domain.py's region_entry_offset/region_exit_offset narrow the `occupied`
+# mutex to a sub-interval of the action (see that module's docstring). MM-dRRT (PlanSkeleton,
+# dRRT*) is unaware of the split and expects exactly one 'transit'/'transfer' entry per high-level
+# action, so _merge_phased_actions folds a split action's phases back into one before anything
+# downstream sees them.
+_PHASE_SUFFIXES = {'-approach': 0, '-occupy': 1, '-depart': 2}
 
-def parse_pddl_plan(pddl_plan, mapper, env):
+
+def _split_phase_type(action_type):
+    """('transit-occupy', 1) for a split-domain phase name, else (action_type, None) unchanged."""
+    for suffix, phase_index in _PHASE_SUFFIXES.items():
+        if action_type.endswith(suffix) and action_type[:-len(suffix)] in ('transit', 'transfer'):
+            return action_type[:-len(suffix)], phase_index
+    return action_type, None
+
+
+def _phase_group_key(action_info):
+    surface = action_info['to_fixed_obj'] if action_info['type'] == 'transfer' else action_info['from_fixed_obj']
+    return (action_info['type'], action_info['robot'], action_info['movable_obj'], surface)
+
+
+def _fold_phase_chain(chain):
+    anchor = next(p for p in chain if p['phase_index'] == 1)  # the occupy phase
+    folded = dict(anchor)
+    folded['start_time'] = min(p['start_time'] for p in chain)
+    folded['end_time'] = max(p['end_time'] for p in chain)
+    # The occupy phase's own interval, not start + alpha: Tamer can insert waits between phases,
+    # so this is the region occupancy the solved schedule actually committed to.
+    folded['occupy_start'] = anchor['start_time']
+    folded['occupy_end'] = anchor['end_time']
+    return folded
+
+
+def _merge_phased_actions(actions_list):
+    """Fold approach/occupy/depart phase chains back into one action per (type, robot, obj,
+    surface) instance.
+
+    Tamer's search is satisficing, not plan-length-optimizing, and can leave dead/incomplete phase
+    chains in a returned plan -- e.g. a spurious extra occupy phase for a surface the robot never
+    actually finishes moving to, alongside the real one it does complete (confirmed via
+    solve_pddl.py on the 2-object crossing relay problem: mm_drrt/pddl/problems/
+    two_robots_crossing_relay_problem.pddl). Whether a depart phase is expected at all for a given
+    base type is inferred from whether one appears ANYWHERE in the plan for that type; an occupy
+    chain for that type that never reaches a depart is such a dead branch and is dropped rather
+    than passed downstream as a half-finished action.
+    """
+    if not any(a.get('phase_index') is not None for a in actions_list):
+        return actions_list
+
+    depart_expected = {a['type'] for a in actions_list if a.get('phase_index') == 2}
+
+    groups = defaultdict(list)
+    merged = [a for a in actions_list if a.get('phase_index') is None]
+    for a in actions_list:
+        if a.get('phase_index') is not None:
+            groups[_phase_group_key(a)].append(a)
+
+    for key, phases in groups.items():
+        phases.sort(key=lambda a: a['start_time'])
+        chain = []
+        for phase in phases:
+            if chain and phase['phase_index'] <= chain[-1]['phase_index']:
+                print(f"Warning: dropping incomplete {chain[0]['type']} phase chain for {key} "
+                     f"({[p['name'] for p in chain]}) -- Tamer's plan never completed it.")
+                chain = []
+            chain.append(phase)
+            if phase['phase_index'] == 2 or (phase['phase_index'] == 1 and phase['type'] not in depart_expected):
+                merged.append(_fold_phase_chain(chain))
+                chain = []
+        if chain:
+            print(f"Warning: dropping incomplete {chain[0]['type']} phase chain for {key} "
+                 f"({[p['name'] for p in chain]}) -- Tamer's plan never completed it.")
+
+    return merged
+
+
+def parse_pddl_plan(pddl_plan, mapper, env, return_schedule=False):
     """
     Convert PDDL plan to MM-dRRT format.
 
@@ -23,6 +100,7 @@ def parse_pddl_plan(pddl_plan, mapper, env):
             action_orders: dict mapping robot → tuple of action names
             obj_orders: dict mapping obj → list of actions manipulating it
             init_order_constraints: tuple of {'pre': action_name, 'post': action_name}
+        If return_schedule=True, a 5th element: the solved schedule (see _build_schedule).
     """
     plan = {}
     action_orders = defaultdict(list)
@@ -30,21 +108,46 @@ def parse_pddl_plan(pddl_plan, mapper, env):
 
     # Parse actions from PDDL plan
     actions_list = []
+    is_classical_plan = False
 
     if hasattr(pddl_plan, 'timed_actions'):
-        # TimeTriggeredPlan (temporal/durative actions)
-        for i, (start_time, action, duration) in enumerate(pddl_plan.timed_actions):
+        # TimeTriggeredPlan (temporal/durative actions).
+        # UPF/Tamer does not guarantee timed_actions is in chronological order.
+        # Sort by start_time so the plan dict and actions_list are chronological —
+        # initialize_robot_plans() preserves dict insertion order and
+        # individual_path_computation() assumes transit(even) before transfer(odd).
+        for i, (start_time, action, duration) in enumerate(
+                sorted(pddl_plan.timed_actions, key=lambda t: (t[0], str(t[1])))):  # stable on ties
             action_name = f"a{i}"
             action_info = _parse_action(action, action_name, mapper, start_time, start_time + duration)
             actions_list.append(action_info)
-            plan[action_name] = action_info['mm_drrt_format']
-    else:
+
+        # Fold any transit-approach/-occupy/-depart (or transfer- equivalent) phase chains back
+        # into one action per pick/place before building plan/action_orders/obj_orders below --
+        # see _merge_phased_actions's docstring. No-op unless pddl_domain.py's
+        # region_entry_offset/region_exit_offset actually split the domain's actions.
+        actions_list = sorted(_merge_phased_actions(actions_list), key=lambda a: a['start_time'])
+        for action_info in actions_list:
+            plan[action_info['name']] = action_info['mm_drrt_format']
+    elif hasattr(pddl_plan, 'actions'):
         # SequentialPlan (non-temporal actions)
         for i, action in enumerate(pddl_plan.actions):
             action_name = f"a{i}"
             action_info = _parse_action(action, action_name, mapper, i, i + 1)
             actions_list.append(action_info)
             plan[action_name] = action_info['mm_drrt_format']
+    else:
+        # Fast Downward plan text or a list of raw action lines
+        is_classical_plan = True
+        if isinstance(pddl_plan, str):
+            pddl_plan = pddl_plan.splitlines()
+        for raw_action in pddl_plan:
+            action_info = _parse_classical_action(raw_action, f"a{len(actions_list)}", mapper,
+                                                 len(actions_list), len(actions_list) + 1)
+            if action_info is None:
+                continue
+            actions_list.append(action_info)
+            plan[action_info['name']] = action_info['mm_drrt_format']
 
     # Extract action orders (group by robot)
     robot_actions = defaultdict(list)
@@ -66,10 +169,42 @@ def parse_pddl_plan(pddl_plan, mapper, env):
             action_name = action_info['name']
             obj_orders[obj].append(action_name)
 
-    # Extract temporal constraints (for multi-robot coordination)
-    init_order_constraints = extract_temporal_constraints(actions_list)
+    # Same-object handoff constraints (robot A transfers object O, robot B later transits the
+    # same O) -- the only thing this pipeline enforced downstream until now.
+    handoff_constraints = extract_sequential_constraints(actions_list)
+    # Cross-robot SAME-SURFACE constraints (see extract_shared_surface_constraints's docstring):
+    # narrower than the old extract_temporal_constraints (removed for producing spurious
+    # constraints between unrelated parallel actions with no shared object OR surface) -- only
+    # pairs that touch the same fixed-obj are considered, so this can't reintroduce that bug.
+    # Deduplicated against handoff_constraints (a handoff pair is usually also same-surface, so
+    # they'd otherwise double up).
+    seen = {(c['pre'], c['post']) for c in handoff_constraints}
+    surface_constraints = tuple(c for c in extract_shared_surface_constraints(actions_list)
+                                if (c['pre'], c['post']) not in seen)
+    init_order_constraints = handoff_constraints + surface_constraints
 
+    if return_schedule:
+        return plan, dict(action_orders), dict(obj_orders), init_order_constraints, \
+            _build_schedule(actions_list)
     return plan, dict(action_orders), dict(obj_orders), init_order_constraints
+
+
+def _build_schedule(actions_list):
+    """The solved plan's timing, as plain floats, for mm_drrt/utils/schedule_repair.py:
+    [{name, type, robot, movable_obj, region, start, end, occupy_start, occupy_end}] in start-time
+    order. `region` is to_fixed_obj (for transit that is already the surface it picks FROM). An
+    unsplit action (full-duration mutex) occupies its region for its whole [start, end]."""
+    schedule = []
+    for a in sorted(actions_list, key=lambda a: a['start_time']):
+        start, end = float(a['start_time']), float(a['end_time'])
+        schedule.append({
+            'name': a['name'], 'type': a['type'], 'robot': a['robot'],
+            'movable_obj': a['movable_obj'], 'region': a['to_fixed_obj'],
+            'start': start, 'end': end,
+            'occupy_start': float(a.get('occupy_start', start)),
+            'occupy_end': float(a.get('occupy_end', end)),
+        })
+    return schedule
 
 
 def _parse_action(action, action_name, mapper, start_time, end_time):
@@ -89,14 +224,89 @@ def _parse_action(action, action_name, mapper, start_time, end_time):
     action_type = action.action.name
     parameters = action.actual_parameters
 
+    return _build_action_info(action_type, parameters, action_name, mapper, start_time, end_time)
+
+
+def _parse_classical_action(raw_action, action_name, mapper, start_time, end_time):
+    """
+    Parse a single Fast Downward action line into MM-dRRT format.
+
+    Args:
+        raw_action: A plan line such as "(transit robot_0 movable_obj_0 fixed_obj_0)"
+        action_name: Assigned action name (e.g., 'a0')
+        mapper: ObjectMapper
+        start_time: Action start time surrogate
+        end_time: Action end time surrogate
+
+    Returns:
+        dict or None: Action information including MM-dRRT format
+    """
+    tokens = _normalize_classical_action_line(raw_action)
+    if not tokens:
+        return None
+
+    action_type = tokens[0]
+    parameters = tokens[1:]
+    return _build_action_info(action_type, parameters, action_name, mapper, start_time, end_time)
+
+
+def _normalize_classical_action_line(raw_action):
+    if not isinstance(raw_action, str):
+        raw_action = str(raw_action)
+
+    line = raw_action.strip()
+    if not line or line.startswith(';'):
+        return None
+
+    if ':' in line:
+        prefix, suffix = line.split(':', 1)
+        if prefix.strip().isdigit():
+            line = suffix.strip()
+
+    if '[' in line and line.endswith(']'):
+        line = line.rsplit('[', 1)[0].strip()
+
+    if line.startswith('(') and line.endswith(')'):
+        line = line[1:-1].strip()
+
+    if not line:
+        return None
+
+    tokens = [t.lower() for t in line.split()]
+
+    # The serialize_cn compiler prefixes compiled action names with "do-".
+    # Strip that prefix so the downstream parser sees "transit", "transfer", etc.
+    if tokens:
+        tokens[0] = tokens[0].removeprefix('do-')
+
+    return tokens
+
+
+def _parameter_name(parameter):
+    if hasattr(parameter, 'object'):
+        return parameter.object().name
+    if hasattr(parameter, 'name'):
+        return parameter.name
+    return str(parameter)
+
+
+def _build_action_info(action_type, parameters, action_name, mapper, start_time, end_time):
+    action_type, phase_index = _split_phase_type(action_type)
+    action_info = _build_unphased_action_info(action_type, parameters, action_name, mapper, start_time, end_time)
+    if action_info is not None:
+        action_info['phase_index'] = phase_index
+    return action_info
+
+
+def _build_unphased_action_info(action_type, parameters, action_name, mapper, start_time, end_time):
     # Extract robot from parameters
-    robot_pddl = parameters[0].object().name
+    robot_pddl = _parameter_name(parameters[0])
     robot = mapper.get_pybullet_obj(robot_pddl)
 
     if action_type == 'transit':
         # transit(robot, movable-obj, from-fixed-obj)
-        movable_obj_pddl = parameters[1].object().name
-        from_fixed_obj_pddl = parameters[2].object().name
+        movable_obj_pddl = _parameter_name(parameters[1])
+        from_fixed_obj_pddl = _parameter_name(parameters[2])
 
         movable_obj = mapper.get_pybullet_obj(movable_obj_pddl)
         from_fixed_obj = mapper.get_pybullet_obj(from_fixed_obj_pddl)
@@ -118,8 +328,8 @@ def _parse_action(action, action_name, mapper, start_time, end_time):
 
     elif action_type == 'transfer':
         # transfer(robot, movable-obj, to-fixed-obj)
-        movable_obj_pddl = parameters[1].object().name
-        to_fixed_obj_pddl = parameters[2].object().name
+        movable_obj_pddl = _parameter_name(parameters[1])
+        to_fixed_obj_pddl = _parameter_name(parameters[2])
 
         movable_obj = mapper.get_pybullet_obj(movable_obj_pddl)
         to_fixed_obj = mapper.get_pybullet_obj(to_fixed_obj_pddl)
@@ -161,7 +371,9 @@ def _parse_action(action, action_name, mapper, start_time, end_time):
         }
 
     else:
-        raise ValueError(f"Unknown action type: {action_type}")
+        # Skip concurrency bookkeeping actions injected by the MA-PDDL compiler
+        # (e.g. "free", "start-*", "end-*").
+        return None
 
 
 def _infer_from_fixed_obj(actions_list):
@@ -247,6 +459,64 @@ def extract_obj_orders(actions_list):
                 obj_orders[obj].append(action_name)
 
     return dict(obj_orders)
+
+
+def extract_sequential_constraints(actions_list):
+    """
+    Derive cross-robot ordering constraints from a sequential (classical) plan.
+
+    For each transfer by robot A that places object O, find the next transit
+    by a different robot B that picks the same object O.  That causal link
+    must be enforced as an ordering constraint so B waits until A has placed O.
+    """
+    constraints = []
+    for i, a_i in enumerate(actions_list):
+        if a_i['type'] != 'transfer':
+            continue
+        for a_j in actions_list[i + 1:]:
+            if a_j['robot'] == a_i['robot']:
+                continue
+            if a_j['type'] == 'transit' and a_j['movable_obj'] == a_i['movable_obj']:
+                constraints.append({'pre': a_i['name'], 'post': a_j['name']})
+                break  # one constraint per transfer is enough
+    return tuple(constraints)
+
+
+def extract_shared_surface_constraints(actions_list):
+    """
+    Derive cross-robot ordering constraints from actions that touch the SAME fixed-obj
+    (to_fixed_obj -- the surface a transit picks up FROM or a transfer places ONTO) and don't
+    overlap in the solved plan's own start/end times.
+
+    extract_sequential_constraints only catches a shared-object handoff (robot A transfers
+    object O, robot B later transits that same O). It has no way to notice that two DIFFERENT
+    robots' actions on two DIFFERENT objects were still forced apart in time because they touch
+    the same physical surface -- e.g. mm_drrt_manipulation.pddl's `occupied` mutex serializing a
+    2-object crossing relay's table_mid, where no single object links the two robots' chains.
+    Without this, that serialization is invisible past this function: PlanSkeleton/dRRT* would
+    treat those actions as fully independent, and a :duration edit that changes how Tamer spaces
+    them out would have no effect on the executed plan at all.
+
+    Deliberately narrower than the old extract_temporal_constraints (removed for producing
+    spurious constraints between unrelated parallel actions with no shared object OR surface):
+    only pairs that reference the same fixed-obj are considered here, so it can't reintroduce
+    that bug.
+
+    Note: dRRT*'s own inter_robots_collision_fn (rai_drrt_star.py) already guarantees physical
+    safety regardless of whether this constraint is present -- this is about matching the
+    solver's chosen concurrency/ordering (and therefore making :duration observably affect
+    execution), not about safety.
+    """
+    constraints = []
+    for i, a_i in enumerate(actions_list):
+        for a_j in actions_list[i + 1:]:
+            if a_i['robot'] == a_j['robot']:
+                continue
+            if a_i['to_fixed_obj'] is None or a_i['to_fixed_obj'] != a_j['to_fixed_obj']:
+                continue
+            if a_i['end_time'] <= a_j['start_time']:
+                constraints.append({'pre': a_i['name'], 'post': a_j['name']})
+    return constraints
 
 
 def extract_temporal_constraints(actions_list):

@@ -200,6 +200,8 @@ def individual_path_computation(robot_plans, env, num_base_samples, num_arm_samp
     for robot in robot_plans:
         each_roadmaps, each_heuristic_vals = [], []
         for id, action in enumerate(robot_plans[robot]):
+            action_start = time.time()
+            print(f"Step 3: planning {action.name} ({action.type}) for robot {robot}")
             if action.type != 'return':
                 if id % 2 == 0: # pick actions
                     if id == 0:
@@ -231,9 +233,11 @@ def individual_path_computation(robot_plans, env, num_base_samples, num_arm_samp
             if result:
                 each_roadmaps += r_each_roadmaps
                 each_heuristic_vals += r_each_heuristic_vals
+                print(f"Step 3: {action.name} completed in {time.time() - action_start:.2f}s")
                 if use_debug:
                     print('In Step 3: '+ str(action) + ' is refined')
             else:
+                print(f"Step 3: {action.name} failed after {time.time() - action_start:.2f}s")
                 return False, [], []
         roadmaps.append(each_roadmaps)
         heuristic_vals.append(each_heuristic_vals)
@@ -255,7 +259,7 @@ def assign_order_constraints(robot_plans):
     constraints = []
     for r in robot_plans.keys():
         constraint = ()
-        for a in robot_plans[r]:
+        for action_idx, a in enumerate(robot_plans[r]):
             pre_set = a.order_constraints['pre']
             pre_index = []
             if pre_set:
@@ -265,6 +269,28 @@ def assign_order_constraints(robot_plans):
                         if robot_plans[nr][j].name in a.order_constraints['pre']:
                             pre_index.append({i: 3 * (j + 1) - 1})    # each action consists of three subactions: base motion, grasp motion, post-grasp motion
                             break
+            # Balance constraint: robot r's j-th action cannot start until all
+            # other robots have reached sub-step 3*j-1 (nearly done with their
+            # (j-1)-th action). This prevents one robot racing far ahead of the
+            # others, which otherwise creates a near-empty composite state space
+            # that dRRT* cannot search through within the time limit.
+            #
+            # Exception: if this action has a handoff post-constraint pointing to
+            # robot nr (meaning nr is waiting for THIS action to complete before it
+            # can begin), adding the balance would deadlock: nr can't advance past
+            # step 0 while r's balance waits for nr to be at step 2.
+            if action_idx > 0:
+                nr_names_cache = {
+                    nr: {act.name for act in robot_plans[nr]}
+                    for nr in robot_plans if nr != r
+                }
+                post_set = a.order_constraints['post']
+                for i, nr in enumerate(robot_plans.keys()):
+                    if r == nr: continue
+                    if any(isinstance(p, str) and p in nr_names_cache[nr]
+                           for p in post_set):
+                        continue  # handoff dependency — skip balance to avoid deadlock
+                    pre_index.append({i: 3 * action_idx - 1})
             constraint += (pre_index,)
         constraints.append(constraint)
     return constraints
@@ -516,6 +542,13 @@ def find_ignore_objs(actions, action, collisions, init_collisions, ignore_from_m
     elif type == 'remove':
         const_actions = actions[action[0]].order_constraints['post']
     for const_action in const_actions:
+        # order_constraints['pre']/['post'] mixes plain action-name strings (from the env's
+        # manually-specified init_order_constraints) with Action objects (auto-appended by
+        # add_order_constraints() below when two objects' sampled placements collide) -- only the
+        # latter can be resolved to a m_obj here, so skip the former (same guard as
+        # assign_order_constraints()'s isinstance(p, str) check).
+        if isinstance(const_action, str):
+            continue
         for collision in collisions:  # collisions with remove_m_objs, add_then_remove_m_objs
             if type == 'add':
                 obj = collision[1]

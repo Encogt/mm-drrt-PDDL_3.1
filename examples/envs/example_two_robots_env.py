@@ -302,7 +302,7 @@ class ExampleTwoRobotsEnvironment(Environment):
 
     def create_pddl_problem(self):
         """
-        PDDL 3.1 problem for the 1-object / 2-robot relay scenario.
+        PDDL 2.1 problem for the 1-object / 2-robot relay scenario.
 
         Layout:
           f_objs[0] (table_start)  — box starts here
