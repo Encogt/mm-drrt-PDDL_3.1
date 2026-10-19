@@ -71,3 +71,21 @@ We provide two example codes to facilitate understanding of how MM-dRRT works. T
 - Two robots, two objects: Set both `num_robots` and `num_objs` to 2. Set `env_type` to `exp_two_robots`. 
 
 In both examples, focus on the `_create_problem` function in `example_single_robot_env` and `example_two_robots_env` files located in the `/examples/envs/` folder to understand how the environments are specified.
+
+## RAI pipeline, PDDL planning, and temporal coordination
+
+The commands above run the original PyBullet implementation (`main.py`) with a hand-written plan
+skeleton. This fork also has a parallel RAI-based pipeline (`main_rai.py`, built on the
+[`robotic`](https://github.com/MarcToussaint/robotic) library) that adds automatic PDDL 2.1
+planning and motion-derived temporal coordination between robots sharing a region:
+
+- **`PDDL_INTEGRATION.md`** -- `--use_pddl_planner`: generating the task plan automatically
+  (Tamer first, Fast Downward as a fallback) instead of writing `create_plan_order_constraints()`
+  by hand.
+- **`docs/minimal_temporal_constraints.md`** -- how two robots conflicting over a shared region
+  are kept apart by only as much as their motion actually requires, measured from real
+  trajectories rather than declared durations.
+- **`demos/README.md`** -- four GUI walkthroughs (`demos/demo1.py`-`demo4.py`), one per
+  contribution above, each runnable headless with `--no_gui`.
+- **`experiments/run_contribution1.py`-`run_contribution4.py`** -- the same four contributions,
+  swept over several seeds with no narration, for a `mean [min, max]` result instead of one run.
